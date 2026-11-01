@@ -1,0 +1,7 @@
+backend/RMS.Api/data/
+backend/RMS.Api/models/
+frontend/node_modules/
+frontend/dist/
+*.user
+bin/
+obj/

@@ -1,0 +1,1200 @@
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authentication;
+using System.Security.Cryptography;
+using System.Text.Json;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.SignalR;
+using Microsoft.EntityFrameworkCore;
+using RMS.Api;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Logging.AddFilter("Microsoft.EntityFrameworkCore.Database.Command", LogLevel.Warning);
+var dataDir = Path.Combine(builder.Environment.ContentRootPath, "data");
+Directory.CreateDirectory(dataDir);
+var dbPath = Path.Combine(dataDir, "rms.db");
+
+builder.Services.AddDbContext<AppDb>(options => options.UseSqlite($"Data Source={dbPath}"));
+builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+    .AddCookie(options =>
+    {
+        options.Cookie.Name = "rms_session";
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SameSite = SameSiteMode.Lax;
+        options.Events.OnRedirectToLogin = context =>
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return Task.CompletedTask;
+        };
+        options.Events.OnRedirectToAccessDenied = context =>
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            return Task.CompletedTask;
+        };
+    });
+builder.Services.AddAuthorization();
+builder.Services.AddSignalR();
+builder.Services.AddHostedService<ExpiryWorker>();
+builder.Services.AddSingleton<AnswerSimilarity>();
+builder.Services.AddHostedService(provider => provider.GetRequiredService<AnswerSimilarity>());
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+        policy.WithOrigins("http://localhost:5173", "http://127.0.0.1:5173")
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials());
+});
+
+var app = builder.Build();
+app.UseDefaultFiles();
+app.UseStaticFiles();
+app.UseCors();
+app.UseAuthentication();
+app.UseAuthorization();
+
+await using (var scope = app.Services.CreateAsyncScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<AppDb>();
+    await db.Database.EnsureCreatedAsync();
+    await db.Database.ExecuteSqlRawAsync("""
+        CREATE TABLE IF NOT EXISTS "Assignments" (
+            "Id" INTEGER NOT NULL CONSTRAINT "PK_Assignments" PRIMARY KEY AUTOINCREMENT,
+            "InvigilatorId" INTEGER NOT NULL,
+            "StudentId" INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS "IX_Assignments_StudentId" ON "Assignments" ("StudentId");
+        CREATE TABLE IF NOT EXISTS AnswerVectors (
+            AnswerId INTEGER NOT NULL PRIMARY KEY,
+            ModelId TEXT NOT NULL,
+            Vector BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS SimilarAnswers (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            LeftAnswerId INTEGER NOT NULL,
+            RightAnswerId INTEGER NOT NULL,
+            Cosine REAL NOT NULL,
+            ModelId TEXT NOT NULL,
+            At TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS IX_SimilarAnswers_Pair ON SimilarAnswers (LeftAnswerId, RightAnswerId);
+        CREATE TABLE IF NOT EXISTS SignalStills (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            SittingId INTEGER NOT NULL,
+            Kind TEXT NOT NULL,
+            At TEXT NOT NULL,
+            Jpeg BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ExamEvents (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            SittingId INTEGER NOT NULL,
+            Kind TEXT NOT NULL,
+            Detail TEXT NOT NULL,
+            Warning INTEGER NOT NULL,
+            At TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ExamSummaries (
+            SittingId INTEGER NOT NULL PRIMARY KEY,
+            ClosedAt TEXT NOT NULL,
+            Warnings INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ExamChecks (
+            SittingId INTEGER NOT NULL PRIMARY KEY,
+            OpenedAt TEXT NOT NULL,
+            CheckedAt TEXT
+        );
+        """);
+    await IdentitySchema.Ensure(db);
+    await Seed.Ensure(db);
+}
+
+app.MapPost("/api/login", async (LoginRequest body, AppDb db, HttpContext http) =>
+{
+    var email = body.Email.Trim().ToLowerInvariant();
+    var user = await db.Users.FirstOrDefaultAsync(u => u.Email == email);
+    if (user is null || !Passwords.Verify(body.Password, user.PasswordHash))
+        return Results.Json(new { error = "Those sign-in details do not match." }, statusCode: StatusCodes.Status401Unauthorized);
+    if (!user.Active)
+        return Results.Json(new { error = "This account is switched off. Ask the system admin." }, statusCode: StatusCodes.Status403Forbidden);
+
+    await Sessions.SignIn(http, user);
+    return Results.Ok(UserView.From(user));
+});
+
+app.MapPost("/api/logout", async (HttpContext http) =>
+{
+    await http.SignOutAsync();
+    return Results.NoContent();
+});
+
+app.MapGet("/api/me", (ClaimsPrincipal user) =>
+{
+    if (user.Identity?.IsAuthenticated != true)
+        return Results.Unauthorized();
+    return Results.Ok(new
+    {
+        id = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!),
+        fullName = user.FindFirstValue(ClaimTypes.Name),
+        email = user.FindFirstValue(ClaimTypes.Email),
+        role = user.FindFirstValue(ClaimTypes.Role)
+    });
+}).RequireAuthorization();
+
+app.MapGet("/api/assessments", async (ClaimsPrincipal user, AppDb db) =>
+{
+    var list = await db.Assessments.AsNoTracking()
+        .Include(a => a.Questions)
+        .OrderByDescending(a => a.Id)
+        .ToListAsync();
+    var role = user.FindFirstValue(ClaimTypes.Role);
+    var userId = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var mine = role == "student"
+        ? (await db.Sittings.AsNoTracking().Where(s => s.StudentId == userId).ToListAsync())
+            .ToDictionary(s => s.AssessmentId)
+        : [];
+    var dutyIds = role == "teacher"
+        ? (await db.ExamDuties.AsNoTracking().Where(item => item.TeacherId == userId).Select(item => item.AssessmentId).ToListAsync()).ToHashSet()
+        : [];
+    return Results.Ok(list.Select(a => AssessmentView.From(
+        a,
+        includeKey: role is "teacher" or "superadmin",
+        sitting: mine.GetValueOrDefault(a.Id),
+        invigilating: dutyIds.Contains(a.Id))));
+}).RequireAuthorization();
+
+app.MapPost("/api/assessments/file", async (HttpRequest request, ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) is not ("teacher" or "superadmin"))
+        return Results.Forbid();
+    if (!request.HasFormContentType)
+        return Results.BadRequest(new { error = "Choose an Excel or Word file." });
+
+    var form = await request.ReadFormAsync();
+    var title = form["title"].ToString();
+    var duration = int.TryParse(form["durationMinutes"], out var minutes) ? minutes : 0;
+    var file = form.Files.GetFile("file");
+    if (file is null || file.Length == 0)
+        return Results.BadRequest(new { error = "Choose an Excel or Word file." });
+    if (file.Length > 5_000_000)
+        return Results.BadRequest(new { error = "The file is larger than 5 MB." });
+
+    var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+    List<Question> questions;
+    try
+    {
+        await using var stream = file.OpenReadStream();
+        questions = extension switch
+        {
+            ".xlsx" => AssessmentFactory.ReadExcel(stream),
+            ".docx" => AssessmentFactory.ReadWord(stream),
+            ".csv" => AssessmentFactory.ReadCsv(stream),
+            _ => throw new InvalidDataException("Upload an Excel workbook (.xlsx) or a Word document (.docx).")
+        };
+    }
+    catch (InvalidDataException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+
+    if (string.IsNullOrWhiteSpace(title))
+        return Results.BadRequest(new { error = "Give the paper a title." });
+    if (duration is < 1 or > 300)
+        return Results.BadRequest(new { error = "Set a time between 1 and 300 minutes." });
+
+    var paper = new Assessment
+    {
+        Title = title.Trim(),
+        DurationMinutes = duration,
+        CreatedById = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!),
+        Questions = questions
+    };
+    db.Assessments.Add(paper);
+    await db.SaveChangesAsync();
+    return Results.Ok(AssessmentView.From(paper, includeKey: true, sitting: null));
+}).RequireAuthorization().DisableAntiforgery();
+
+app.MapPost("/api/assessments", async (AssessmentWrite body, ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) is not ("teacher" or "superadmin"))
+        return Results.Forbid();
+
+    var parsed = AssessmentFactory.Create(body, int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!));
+    if (parsed.Error is not null)
+        return Results.BadRequest(new { error = parsed.Error });
+
+    db.Assessments.Add(parsed.Assessment!);
+    await db.SaveChangesAsync();
+    return Results.Ok(AssessmentView.From(parsed.Assessment!, includeKey: true));
+}).RequireAuthorization();
+
+app.MapPost("/api/sittings", async (StartSitting body, ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) != "student")
+        return Results.Json(new { error = "Only a student can sit a paper." }, statusCode: StatusCodes.Status403Forbidden);
+
+    var studentId = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var assessment = await db.Assessments.Include(a => a.Questions).FirstOrDefaultAsync(a => a.Id == body.AssessmentId);
+    if (assessment is null)
+        return Results.NotFound(new { error = "That paper does not exist." });
+    if (assessment.DurationMinutes < 1)
+        return Results.BadRequest(new { error = "This paper has no duration." });
+
+    var existing = await db.Sittings.Include(s => s.Answers).Include(s => s.Assessment)!.ThenInclude(a => a!.Questions)
+        .FirstOrDefaultAsync(s => s.AssessmentId == assessment.Id && s.StudentId == studentId);
+    if (existing is not null)
+    {
+        var nowExisting = DateTimeOffset.UtcNow;
+        if (ExamClock.TryExpire(existing, nowExisting))
+            await db.SaveChangesAsync();
+        return Results.Ok(await SittingView.Build(db, existing, nowExisting));
+    }
+
+    var now = DateTimeOffset.UtcNow;
+    var sitting = new Sitting
+    {
+        AssessmentId = assessment.Id,
+        StudentId = studentId,
+        StartedAt = now,
+        EndsAt = now.AddMinutes(assessment.DurationMinutes),
+        Status = SittingStatus.InProgress,
+        MaxScore = assessment.Questions.Sum(q => q.Marks)
+    };
+    db.Sittings.Add(sitting);
+    await db.SaveChangesAsync();
+    sitting.Assessment = assessment;
+    return Results.Ok(await SittingView.Build(db, sitting, now));
+}).RequireAuthorization();
+
+app.MapGet("/api/sittings", async (ClaimsPrincipal user, AppDb db, HttpRequest request) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) is not ("teacher" or "superadmin"))
+        return Results.Forbid();
+
+    var status = request.Query["status"].ToString();
+    if (status is not (SittingStatus.InProgress or SittingStatus.Submitted))
+        return Results.BadRequest(new { error = "Choose undertaking or submitted." });
+
+    var draw = int.TryParse(request.Query["draw"], out var parsedDraw) ? parsedDraw : 1;
+    var start = int.TryParse(request.Query["start"], out var parsedStart) && parsedStart > 0 ? parsedStart : 0;
+    var length = int.TryParse(request.Query["length"], out var parsedLength) && parsedLength is > 0 and <= 100 ? parsedLength : 10;
+    var term = request.Query["search[value]"].ToString().Trim().Replace("%", "").Replace("_", "");
+    var orderColumn = int.TryParse(request.Query["order[0][column]"], out var parsedColumn) ? parsedColumn : 0;
+    var descending = request.Query["order[0][dir]"].ToString() == "desc";
+
+    var query =
+        from sitting in db.Sittings.AsNoTracking()
+        join student in db.Users.AsNoTracking() on sitting.StudentId equals student.Id
+        join paper in db.Assessments.AsNoTracking() on sitting.AssessmentId equals paper.Id
+        where sitting.Status == status
+        select new { sitting, student, paper };
+
+    var recordsTotal = await query.CountAsync();
+    if (term.Length > 0)
+    {
+        var pattern = $"%{term}%";
+        query = query.Where(row =>
+            EF.Functions.Like(row.student.FullName, pattern) ||
+            EF.Functions.Like(row.student.Email, pattern) ||
+            EF.Functions.Like(row.paper.Title, pattern));
+    }
+
+    query = (orderColumn, descending) switch
+    {
+        (1, true) => query.OrderByDescending(row => row.student.Email),
+        (1, false) => query.OrderBy(row => row.student.Email),
+        (2, true) => query.OrderByDescending(row => row.paper.Title),
+        (2, false) => query.OrderBy(row => row.paper.Title),
+        (3, true) => query.OrderByDescending(row => row.sitting.Score).ThenByDescending(row => row.sitting.Id),
+        (3, false) => query.OrderBy(row => row.sitting.Score).ThenBy(row => row.sitting.Id),
+        (_, true) => query.OrderByDescending(row => row.student.FullName),
+        _ => query.OrderBy(row => row.student.FullName)
+    };
+
+    var recordsFiltered = await query.CountAsync();
+    var pageRows = await query.Skip(start).Take(length).ToListAsync();
+    var undertakingTotal = await db.Sittings.CountAsync(s => s.Status == SittingStatus.InProgress);
+    var submittedTotal = await db.Sittings.CountAsync(s => s.Status == SittingStatus.Submitted);
+    var now = DateTimeOffset.UtcNow;
+
+    return Results.Ok(new
+    {
+        draw,
+        recordsTotal,
+        recordsFiltered,
+        undertakingTotal,
+        submittedTotal,
+        data = pageRows.Select(row =>
+        {
+            var remaining = row.sitting.EndsAt - now;
+            if (remaining < TimeSpan.Zero)
+                remaining = TimeSpan.Zero;
+            return new
+            {
+                id = row.sitting.Id,
+                studentName = row.student.FullName,
+                email = row.student.Email,
+                paper = row.paper.Title,
+                score = row.sitting.Status == SittingStatus.InProgress ? (int?)null : row.sitting.Score,
+                maxScore = row.sitting.MaxScore,
+                remainingSeconds = row.sitting.Status == SittingStatus.InProgress ? (int)Math.Ceiling(remaining.TotalSeconds) : 0
+            };
+        })
+    });
+}).RequireAuthorization();
+
+app.MapGet("/api/sittings/{id:int}", async (int id, ClaimsPrincipal user, AppDb db, IHubContext<DeskHub> hub) =>
+{
+    var sitting = await LoadSitting(db, id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (!CanRead(user, sitting))
+        return Results.Forbid();
+
+    var now = DateTimeOffset.UtcNow;
+    if (ExamClock.TryExpire(sitting, now))
+    {
+        await db.SaveChangesAsync();
+        await NotifyExpired(hub, sitting);
+    }
+
+    return Results.Ok(await SittingView.Build(db, sitting, now));
+}).RequireAuthorization();
+
+app.MapPut("/api/sittings/{id:int}/answers", async (int id, SaveAnswer body, ClaimsPrincipal user, AppDb db, AnswerSimilarity similarity) =>
+{
+    var sitting = await LoadSitting(db, id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (!IsOwner(user, sitting))
+        return Results.Forbid();
+
+    var now = DateTimeOffset.UtcNow;
+    if (ExamClock.TryExpire(sitting, now))
+    {
+        await db.SaveChangesAsync();
+        return Results.Json(new { error = "Time is up. This paper was not submitted, so it receives no marks.", score = 0 }, statusCode: StatusCodes.Status409Conflict);
+    }
+
+    var question = sitting.Assessment!.Questions.FirstOrDefault(q => q.Id == body.QuestionId);
+    if (question is null)
+        return Results.BadRequest(new { error = "That question is not on this paper." });
+
+    var answer = sitting.Answers.FirstOrDefault(a => a.QuestionId == question.Id);
+    if (answer is null)
+    {
+        answer = new Answer { SittingId = sitting.Id, QuestionId = question.Id };
+        sitting.Answers.Add(answer);
+    }
+    answer.Response = body.Response.Trim();
+    await db.SaveChangesAsync();
+    if (question.Type == "short")
+        similarity.Consider(answer.Id);
+    return Results.Ok(await SittingView.Build(db, sitting, now));
+}).RequireAuthorization();
+
+app.MapPost("/api/sittings/{id:int}/submit", async (int id, ClaimsPrincipal user, AppDb db, IHubContext<DeskHub> hub) =>
+{
+    var sitting = await LoadSitting(db, id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (!IsOwner(user, sitting))
+        return Results.Forbid();
+
+    var now = DateTimeOffset.UtcNow;
+    var graded = Marking.Score(sitting);
+    if (!ExamClock.TrySubmit(sitting, now, graded))
+    {
+        await db.SaveChangesAsync();
+        await NotifyExpired(hub, sitting);
+        await ExamLog.Seal(db, sitting.Id);
+        return Results.Json(new { error = "Time is up. This paper was not submitted, so it receives no marks.", score = 0, status = sitting.Status }, statusCode: StatusCodes.Status409Conflict);
+    }
+
+    await db.SaveChangesAsync();
+    if (sitting.Status is SittingStatus.Submitted or SittingStatus.Expired)
+        await ExamLog.Seal(db, sitting.Id);
+    return Results.Ok(await SittingView.Build(db, sitting, now));
+}).RequireAuthorization();
+
+app.MapPost("/api/sittings/{id:int}/expire", async (int id, ClaimsPrincipal user, AppDb db, IHubContext<DeskHub> hub) =>
+{
+    var sitting = await LoadSitting(db, id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (!CanRead(user, sitting))
+        return Results.Forbid();
+
+    var now = DateTimeOffset.UtcNow;
+    ExamClock.TryExpire(sitting, now);
+    await db.SaveChangesAsync();
+    if (sitting.Status == SittingStatus.Expired)
+    {
+        await NotifyExpired(hub, sitting);
+        await ExamLog.Seal(db, sitting.Id);
+    }
+    return Results.Ok(await SittingView.Build(db, sitting, now));
+}).RequireAuthorization();
+
+app.MapGet("/api/wall", async (ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) is not ("invigilator" or "superadmin" or "teacher"))
+        return Results.Forbid();
+
+    var role = user.FindFirstValue(ClaimTypes.Role);
+    var userId = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var assigned = role == "invigilator"
+        ? await db.Assignments.AsNoTracking().Where(item => item.InvigilatorId == userId).Select(item => item.StudentId).ToListAsync()
+        : null;
+    var rows = await (
+        from sitting in db.Sittings.AsNoTracking()
+        join student in db.Users.AsNoTracking() on sitting.StudentId equals student.Id
+        join paper in db.Assessments.AsNoTracking() on sitting.AssessmentId equals paper.Id
+        where sitting.Status == SittingStatus.InProgress
+        orderby student.FullName
+        select new { sitting.Id, sitting.EndsAt, studentId = student.Id, student.FullName, student.Email, paper.Title }
+    ).ToListAsync();
+    if (assigned is not null)
+        rows = rows.Where(row => assigned.Contains(row.studentId)).ToList();
+
+    var now = DateTimeOffset.UtcNow;
+    return Results.Ok(rows.Select(row =>
+    {
+        var remaining = row.EndsAt - now;
+        if (remaining < TimeSpan.Zero)
+            remaining = TimeSpan.Zero;
+        LiveBoard.Hands.TryGetValue(row.Id, out var hand);
+        return new
+        {
+            id = row.Id,
+            studentName = row.FullName,
+            email = row.Email,
+            paper = row.Title,
+            remainingSeconds = (int)Math.Ceiling(remaining.TotalSeconds),
+            hand = hand is not null,
+            note = hand?.Note ?? "",
+            camera = CameraWall.IsFresh(row.Id, now)
+        };
+    }));
+}).RequireAuthorization();
+
+app.MapGet("/api/wall/{id:int}/frame", (int id, ClaimsPrincipal user, HttpContext http) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) is not ("invigilator" or "superadmin" or "teacher"))
+        return Results.Forbid();
+    var since = long.TryParse(http.Request.Query["since"], out var parsed) ? parsed : 0;
+    http.Response.Headers.CacheControl = "no-store";
+    if (!CameraWall.TryGetNewer(id, since, out var jpeg, out var version))
+    {
+        http.Response.Headers["X-Frame"] = version.ToString();
+        return Results.NoContent();
+    }
+    http.Response.Headers["X-Frame"] = version.ToString();
+    return Results.Bytes(jpeg, "image/jpeg");
+}).RequireAuthorization();
+
+app.MapPost("/api/sittings/{id:int}/frame", async (int id, ClaimsPrincipal user, AppDb db, HttpRequest request) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) != "student")
+        return Results.Forbid();
+    var studentId = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var sitting = await db.Sittings.AsNoTracking().FirstOrDefaultAsync(item => item.Id == id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (sitting.StudentId != studentId || sitting.Status != SittingStatus.InProgress)
+        return Results.Forbid();
+
+    var jpeg = await ReadLimited(request.Body, 200_000);
+    if (jpeg is null || jpeg.Length < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
+        return Results.BadRequest(new { error = "Send one small JPEG." });
+
+    CameraWall.Store(id, jpeg);
+    return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapPost("/api/sittings/{id:int}/warning", async (int id, WarningWrite body, ClaimsPrincipal user, AppDb db, IHubContext<DeskHub> hub) =>
+{
+    if (body.Kind is not ("head-away" or "face-missing"))
+        return Results.BadRequest(new { error = "That is not a paper warning." });
+    if (user.FindFirstValue(ClaimTypes.Role) != "student")
+        return Results.Forbid();
+    var studentId = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var sitting = await db.Sittings.AsNoTracking().FirstOrDefaultAsync(item => item.Id == id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (sitting.StudentId != studentId || sitting.Status != SittingStatus.InProgress)
+        return Results.Forbid();
+
+    var detail = body.Kind == "face-missing" ? "Warned to face the paper" : "Warned to look at the paper";
+    var check = await ExamLog.Warn(db, id, body.Kind, detail, debounce: false);
+    if (check is not null)
+        await ExamLog.NotifyCheck(hub, db, check);
+    return Results.Ok(new { warnings = await ExamLog.WarningCount(db, id) });
+}).RequireAuthorization();
+
+app.MapPost("/api/sittings/{id:int}/summary", async (int id, ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) != "student")
+        return Results.Forbid();
+    var studentId = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var sitting = await db.Sittings.AsNoTracking().FirstOrDefaultAsync(item => item.Id == id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (sitting.StudentId != studentId)
+        return Results.Forbid();
+    if (sitting.Status is not (SittingStatus.Submitted or SittingStatus.Expired))
+        return Results.BadRequest(new { error = "The summary is uploaded when the paper ends." });
+    await ExamLog.Seal(db, id);
+    return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapGet("/api/summaries", async (ClaimsPrincipal user, AppDb db, HttpRequest request) =>
+{
+    var role = user.FindFirstValue(ClaimTypes.Role);
+    if (role is not ("invigilator" or "teacher" or "superadmin"))
+        return Results.Forbid();
+    var invigilatorId = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var dutyJoin = role switch
+    {
+        "teacher" => "JOIN ExamDuties duty ON duty.AssessmentId = sitting.AssessmentId AND duty.TeacherId = $watch",
+        "invigilator" => "JOIN Assignments duty ON duty.StudentId = sitting.StudentId AND duty.InvigilatorId = $watch",
+        _ => ""
+    };
+    var draw = int.TryParse(request.Query["draw"], out var parsedDraw) ? parsedDraw : 1;
+    var start = int.TryParse(request.Query["start"], out var parsedStart) && parsedStart > 0 ? parsedStart : 0;
+    var length = int.TryParse(request.Query["length"], out var parsedLength) && parsedLength is > 0 and <= 100 ? parsedLength : 8;
+    var term = request.Query["search[value]"].ToString().Trim().Replace("%", "").Replace("_", "");
+    var orderColumn = int.TryParse(request.Query["order[0][column]"], out var parsedColumn) ? parsedColumn : 3;
+    var descending = request.Query["order[0][dir]"].ToString() != "asc";
+    var order = orderColumn switch
+    {
+        0 => "student.FullName",
+        1 => "paper.Title",
+        2 => "summary.ClosedAt",
+        4 => "stills",
+        5 => "sitting.Score",
+        _ => "summary.Warnings"
+    };
+    var direction = descending ? "DESC" : "ASC";
+    var connection = (Microsoft.Data.Sqlite.SqliteConnection)db.Database.GetDbConnection();
+    if (connection.State != System.Data.ConnectionState.Open)
+        await connection.OpenAsync();
+
+    var from = $"""
+        FROM ExamSummaries summary
+        JOIN Sittings sitting ON sitting.Id = summary.SittingId
+        JOIN Users student ON student.Id = sitting.StudentId
+        JOIN Assessments paper ON paper.Id = sitting.AssessmentId
+        {dutyJoin}
+        """;
+    await using var total = connection.CreateCommand();
+    total.CommandText = $"SELECT COUNT(*) {from}";
+    total.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$watch", invigilatorId));
+    var recordsTotal = Convert.ToInt32(await total.ExecuteScalarAsync());
+
+    var filter = term.Length > 0 ? "WHERE student.FullName LIKE $term OR student.Email LIKE $term OR paper.Title LIKE $term" : "";
+    await using var filtered = connection.CreateCommand();
+    filtered.CommandText = $"SELECT COUNT(*) {from} {filter}";
+    filtered.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$watch", invigilatorId));
+    if (term.Length > 0)
+        filtered.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$term", $"%{term}%"));
+    var recordsFiltered = Convert.ToInt32(await filtered.ExecuteScalarAsync());
+
+    await using var page = connection.CreateCommand();
+    page.CommandText = $"""
+        SELECT sitting.Id, student.FullName, student.Email, paper.Title, sitting.Status, sitting.Score, sitting.MaxScore,
+               summary.ClosedAt, summary.Warnings,
+               (SELECT COUNT(*) FROM SignalStills still WHERE still.SittingId = sitting.Id) AS stills
+        {from}
+        {filter}
+        ORDER BY {order} {direction}, sitting.Id DESC
+        LIMIT $length OFFSET $start
+        """;
+    page.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$watch", invigilatorId));
+    page.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$length", length));
+    page.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$start", start));
+    if (term.Length > 0)
+        page.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$term", $"%{term}%"));
+    var data = new List<object>();
+    await using var reader = await page.ExecuteReaderAsync();
+    while (await reader.ReadAsync())
+    {
+        data.Add(new
+        {
+            id = reader.GetInt32(0),
+            studentName = reader.GetString(1),
+            email = reader.GetString(2),
+            paper = reader.GetString(3),
+            status = reader.GetString(4),
+            score = reader.GetInt32(5),
+            maxScore = reader.GetInt32(6),
+            ended = reader.GetString(7),
+            warnings = reader.GetInt32(8),
+            screenshots = reader.GetInt32(9)
+        });
+    }
+
+    return Results.Ok(new { draw, recordsTotal, recordsFiltered, data });
+}).RequireAuthorization();
+
+app.MapGet("/api/summaries/{id:int}", async (int id, ClaimsPrincipal user, AppDb db) =>
+{
+    if (!await CanReadSummary(user, db, id))
+        return Results.Forbid();
+    var connection = (Microsoft.Data.Sqlite.SqliteConnection)db.Database.GetDbConnection();
+    if (connection.State != System.Data.ConnectionState.Open)
+        await connection.OpenAsync();
+    var events = new List<object>();
+    await using (var command = connection.CreateCommand())
+    {
+        command.CommandText = "SELECT Kind, Detail, Warning, At FROM ExamEvents WHERE SittingId = $id ORDER BY Id";
+        command.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$id", id));
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            events.Add(new { kind = reader.GetString(0), detail = reader.GetString(1), warning = reader.GetInt32(2) == 1, at = reader.GetString(3) });
+    }
+    var stills = new List<object>();
+    await using (var command = connection.CreateCommand())
+    {
+        command.CommandText = "SELECT Id, Kind, At FROM SignalStills WHERE SittingId = $id ORDER BY Id";
+        command.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$id", id));
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            stills.Add(new { id = reader.GetInt32(0), kind = reader.GetString(1), at = reader.GetString(2) });
+    }
+    return Results.Ok(new { events, stills });
+}).RequireAuthorization();
+
+app.MapGet("/api/summaries/stills/{stillId:int}", async (int stillId, ClaimsPrincipal user, AppDb db) =>
+{
+    var connection = (Microsoft.Data.Sqlite.SqliteConnection)db.Database.GetDbConnection();
+    if (connection.State != System.Data.ConnectionState.Open)
+        await connection.OpenAsync();
+    await using var command = connection.CreateCommand();
+    command.CommandText = "SELECT SittingId, Jpeg FROM SignalStills WHERE Id = $id";
+    command.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$id", stillId));
+    await using var reader = await command.ExecuteReaderAsync();
+    if (!await reader.ReadAsync())
+        return Results.NotFound();
+    var sittingId = reader.GetInt32(0);
+    var jpeg = (byte[])reader["Jpeg"];
+    if (!await CanReadSummary(user, db, sittingId))
+        return Results.Forbid();
+    return Results.Bytes(jpeg, "image/jpeg");
+}).RequireAuthorization();
+
+app.MapGet("/api/checks", async (ClaimsPrincipal user, AppDb db) =>
+{
+    var role = user.FindFirstValue(ClaimTypes.Role);
+    if (role is not ("invigilator" or "teacher" or "superadmin"))
+        return Results.Forbid();
+    var invigilatorId = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var dutyJoin = role switch
+    {
+        "teacher" => "JOIN ExamDuties duty ON duty.AssessmentId = sitting.AssessmentId AND duty.TeacherId = $watch",
+        "invigilator" => "JOIN Assignments duty ON duty.StudentId = sitting.StudentId AND duty.InvigilatorId = $watch",
+        _ => ""
+    };
+    var connection = (Microsoft.Data.Sqlite.SqliteConnection)db.Database.GetDbConnection();
+    if (connection.State != System.Data.ConnectionState.Open)
+        await connection.OpenAsync();
+    await using var command = connection.CreateCommand();
+    command.CommandText = $"""
+        SELECT checkrow.SittingId, student.FullName, paper.Title,
+               (SELECT COUNT(*) FROM ExamEvents logged WHERE logged.SittingId = checkrow.SittingId AND logged.Warning = 1)
+        FROM ExamChecks checkrow
+        JOIN Sittings sitting ON sitting.Id = checkrow.SittingId
+        JOIN Users student ON student.Id = sitting.StudentId
+        JOIN Assessments paper ON paper.Id = sitting.AssessmentId
+        {dutyJoin}
+        WHERE checkrow.CheckedAt IS NULL
+        """;
+    command.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$watch", invigilatorId));
+    var checks = new List<CheckCall>();
+    await using var reader = await command.ExecuteReaderAsync();
+    while (await reader.ReadAsync())
+    {
+        var warnings = reader.GetInt32(3);
+        if (ExamLog.NeedsCheck(warnings))
+            checks.Add(new CheckCall(reader.GetInt32(0), reader.GetString(1), reader.GetString(2), warnings));
+    }
+    return Results.Ok(checks);
+}).RequireAuthorization();
+
+app.MapPost("/api/checks/{id:int}/seen", async (int id, ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) is not ("invigilator" or "teacher" or "superadmin") || !await CanReadSummary(user, db, id))
+        return Results.Forbid();
+    var connection = (Microsoft.Data.Sqlite.SqliteConnection)db.Database.GetDbConnection();
+    if (connection.State != System.Data.ConnectionState.Open)
+        await connection.OpenAsync();
+    await using var command = connection.CreateCommand();
+    command.CommandText = "UPDATE ExamChecks SET CheckedAt = $at WHERE SittingId = $id AND CheckedAt IS NULL";
+    command.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$at", DateTimeOffset.UtcNow.ToString("O")));
+    command.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$id", id));
+    await command.ExecuteNonQueryAsync();
+    return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapPost("/api/sittings/{id:int}/still", async (int id, string kind, ClaimsPrincipal user, AppDb db, HttpRequest request) =>
+{
+    if (kind is not ("face-missing" or "second-face" or "head-away" or "hand-ear"))
+        return Results.BadRequest(new { error = "That still is not a camera signal." });
+    if (user.FindFirstValue(ClaimTypes.Role) != "student")
+        return Results.Forbid();
+    var studentId = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    var sitting = await db.Sittings.AsNoTracking().FirstOrDefaultAsync(item => item.Id == id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (sitting.StudentId != studentId || sitting.Status != SittingStatus.InProgress)
+        return Results.Forbid();
+
+    var jpeg = await ReadLimited(request.Body, 300_000);
+    if (jpeg is null || jpeg.Length < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8)
+        return Results.BadRequest(new { error = "Send one small JPEG." });
+
+    var connection = (Microsoft.Data.Sqlite.SqliteConnection)db.Database.GetDbConnection();
+    if (connection.State != System.Data.ConnectionState.Open)
+        await connection.OpenAsync();
+    await using (var latest = connection.CreateCommand())
+    {
+        latest.CommandText = "SELECT At FROM SignalStills WHERE SittingId = $id AND Kind = $kind ORDER BY Id DESC LIMIT 1";
+        latest.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$id", id));
+        latest.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$kind", kind));
+        var previous = await latest.ExecuteScalarAsync() as string;
+        if (DateTimeOffset.TryParse(previous, out var at) && DateTimeOffset.UtcNow - at < TimeSpan.FromSeconds(60))
+            return Results.NoContent();
+    }
+    await using var insert = connection.CreateCommand();
+    insert.CommandText = "INSERT INTO SignalStills (SittingId, Kind, At, Jpeg) VALUES ($id, $kind, $at, $jpeg)";
+    insert.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$id", id));
+    insert.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$kind", kind));
+    insert.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$at", DateTimeOffset.UtcNow.ToString("O")));
+    insert.Parameters.Add(new Microsoft.Data.Sqlite.SqliteParameter("$jpeg", jpeg));
+    await insert.ExecuteNonQueryAsync();
+    return Results.NoContent();
+}).RequireAuthorization();
+
+app.MapGet("/api/roster", async (ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) != "superadmin")
+        return Results.Forbid();
+
+    var people = await db.Users.AsNoTracking().OrderBy(item => item.FullName).ToListAsync();
+    var assignments = await db.Assignments.AsNoTracking().ToListAsync();
+    var open = await (
+        from sitting in db.Sittings.AsNoTracking()
+        join paper in db.Assessments.AsNoTracking() on sitting.AssessmentId equals paper.Id
+        where sitting.Status == SittingStatus.InProgress
+        select new { sitting.StudentId, paper.Title }
+    ).ToListAsync();
+
+    return Results.Ok(new
+    {
+        invigilators = people.Where(item => item.Role == "invigilator").Select(item => new { item.Id, item.FullName, item.Email }),
+        students = people.Where(item => item.Role == "student").Select(item => new
+        {
+            item.Id,
+            item.FullName,
+            item.Email,
+            invigilatorId = assignments.FirstOrDefault(row => row.StudentId == item.Id)?.InvigilatorId,
+            paper = open.FirstOrDefault(row => row.StudentId == item.Id)?.Title
+        })
+    });
+}).RequireAuthorization();
+
+app.MapPost("/api/roster", async (RosterWrite body, ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) != "superadmin")
+        return Results.Forbid();
+
+    var student = await db.Users.FirstOrDefaultAsync(item => item.Id == body.StudentId && item.Role == "student");
+    if (student is null)
+        return Results.BadRequest(new { error = "Choose a candidate." });
+
+    var existing = await db.Assignments.FirstOrDefaultAsync(item => item.StudentId == student.Id);
+    if (body.InvigilatorId is null)
+    {
+        if (existing is not null)
+            db.Assignments.Remove(existing);
+    }
+    else
+    {
+        var watch = await db.Users.FirstOrDefaultAsync(item => item.Id == body.InvigilatorId && item.Role == "invigilator");
+        if (watch is null)
+            return Results.BadRequest(new { error = "Choose an invigilator." });
+        if (existing is null)
+            db.Assignments.Add(new Assignment { StudentId = student.Id, InvigilatorId = watch.Id });
+        else
+            existing.InvigilatorId = watch.Id;
+    }
+
+    await db.SaveChangesAsync();
+    return Results.NoContent();
+}).RequireAuthorization();
+
+PeopleEndpoints.Map(app);
+app.MapHub<DeskHub>("/hubs/desk");
+app.MapFallbackToFile("index.html");
+app.Run();
+
+static async Task<byte[]?> ReadLimited(Stream body, int max)
+{
+    using var buffer = new MemoryStream();
+    var chunk = new byte[8192];
+    while (true)
+    {
+        var read = await body.ReadAsync(chunk);
+        if (read == 0)
+            break;
+        if (buffer.Length + read > max)
+            return null;
+        buffer.Write(chunk, 0, read);
+    }
+    return buffer.ToArray();
+}
+
+static async Task<Sitting?> LoadSitting(AppDb db, int id) =>
+    await db.Sittings
+        .Include(s => s.Answers)
+        .Include(s => s.Assessment)!.ThenInclude(a => a!.Questions)
+        .FirstOrDefaultAsync(s => s.Id == id);
+
+static bool IsOwner(ClaimsPrincipal user, Sitting sitting) =>
+    user.FindFirstValue(ClaimTypes.Role) == "student"
+    && int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!) == sitting.StudentId;
+
+static async Task<bool> CanReadSummary(ClaimsPrincipal user, AppDb db, int sittingId)
+{
+    var role = user.FindFirstValue(ClaimTypes.Role);
+    if (role is not ("invigilator" or "teacher" or "superadmin"))
+        return false;
+    var sitting = await db.Sittings.AsNoTracking()
+        .Where(item => item.Id == sittingId)
+        .Select(item => new { item.StudentId, item.AssessmentId })
+        .FirstOrDefaultAsync();
+    if (sitting is null)
+        return false;
+    if (role == "superadmin")
+        return true;
+    var who = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    if (role == "teacher")
+        return await db.ExamDuties.AsNoTracking().AnyAsync(item => item.TeacherId == who && item.AssessmentId == sitting.AssessmentId);
+    return await db.Assignments.AsNoTracking().AnyAsync(item => item.InvigilatorId == who && item.StudentId == sitting.StudentId);
+}
+
+static bool CanRead(ClaimsPrincipal user, Sitting sitting)
+{
+    var role = user.FindFirstValue(ClaimTypes.Role);
+    var id = int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!);
+    return role is "teacher" or "superadmin" or "invigilator" || id == sitting.StudentId;
+}
+
+static Task NotifyExpired(IHubContext<DeskHub> hub, Sitting sitting) =>
+    hub.Clients.Group(DeskHub.Group(sitting.Id)).SendAsync("expired", new
+    {
+        sittingId = sitting.Id,
+        status = sitting.Status,
+        score = sitting.Score,
+        phase = "ended"
+    });
+
+public sealed record LoginRequest(string Email, string Password);
+
+public sealed record RosterWrite(int StudentId, int? InvigilatorId);
+public sealed record StartSitting(int AssessmentId);
+public sealed record SaveAnswer(int QuestionId, string Response);
+public sealed record WarningWrite(string Kind);
+public sealed record QuestionWrite(string Type, string Prompt, List<string>? Options, string Answer, int Marks);
+public sealed record AssessmentWrite(string Title, int DurationMinutes, string? Csv, List<QuestionWrite>? Questions);
+
+public static partial class AssessmentFactory
+{
+    public static (Assessment? Assessment, string? Error) Create(AssessmentWrite body, int teacherId)
+    {
+        if (string.IsNullOrWhiteSpace(body.Title))
+            return (null, "Give the paper a title.");
+        if (body.DurationMinutes is < 1 or > 300)
+            return (null, "Set a time between 1 and 300 minutes.");
+
+        List<Question> questions;
+        try
+        {
+            questions = body.Csv is { Length: > 0 }
+                ? ParseCsv(body.Csv)
+                : (body.Questions ?? []).Select(ToQuestion).ToList();
+        }
+        catch (InvalidDataException ex)
+        {
+            return (null, ex.Message);
+        }
+
+        if (questions.Count == 0)
+            return (null, "Add at least one question.");
+
+        return (new Assessment
+        {
+            Title = body.Title.Trim(),
+            DurationMinutes = body.DurationMinutes,
+            CreatedById = teacherId,
+            Questions = questions
+        }, null);
+    }
+
+    public static List<Question> FromWrites(IEnumerable<QuestionWrite> writes) => writes.Select(ToQuestion).ToList();
+
+    private static Question ToQuestion(QuestionWrite write)
+    {
+        var type = write.Type.Trim().ToLowerInvariant();
+        if (type is not ("mcq" or "short"))
+            throw new InvalidDataException("Each question is mcq or short.");
+        if (string.IsNullOrWhiteSpace(write.Prompt))
+            throw new InvalidDataException("Each question needs a prompt.");
+        var marks = write.Marks < 1 ? 1 : write.Marks;
+        if (type == "mcq")
+        {
+            var options = write.Options ?? [];
+            if (options.Count != 4 || options.Any(string.IsNullOrWhiteSpace))
+                throw new InvalidDataException("A multiple-choice question needs four options.");
+            var letter = write.Answer.Trim().ToUpperInvariant();
+            if (letter is not ("A" or "B" or "C" or "D"))
+                throw new InvalidDataException("The correct option is A, B, C, or D.");
+            return new Question
+            {
+                Type = type,
+                Prompt = write.Prompt.Trim(),
+                OptionsJson = JsonSerializer.Serialize(options.Select(o => o.Trim()).ToList()),
+                Answer = letter,
+                Marks = marks
+            };
+        }
+
+        if (string.IsNullOrWhiteSpace(write.Answer))
+            throw new InvalidDataException("A short question needs a model answer.");
+        return new Question
+        {
+            Type = type,
+            Prompt = write.Prompt.Trim(),
+            OptionsJson = "[]",
+            Answer = write.Answer.Trim(),
+            Marks = marks
+        };
+    }
+
+    public static List<Question> ReadCsv(Stream stream)
+    {
+        using var reader = new StreamReader(stream);
+        var lines = reader.ReadToEnd().Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return FromRows(lines.Select(SplitCsv).ToList());
+    }
+
+    private static List<Question> ParseCsv(string csv)
+    {
+        var lines = csv.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (lines.Length < 2)
+            throw new InvalidDataException("The upload needs a header row and at least one question.");
+        var questions = new List<Question>();
+        foreach (var line in lines.Skip(1))
+        {
+            var cells = SplitCsv(line);
+            if (cells.Count < 8)
+                throw new InvalidDataException($"This row is incomplete: {line}");
+            questions.Add(ToQuestion(new QuestionWrite(
+                cells[0],
+                cells[1],
+                [cells[2], cells[3], cells[4], cells[5]],
+                cells[6],
+                int.TryParse(cells[7], out var marks) ? marks : 1)));
+        }
+        return questions;
+    }
+
+    private static List<string> SplitCsv(string line)
+    {
+        var cells = new List<string>();
+        var current = new System.Text.StringBuilder();
+        var quoted = false;
+        foreach (var ch in line)
+        {
+            if (ch == '"')
+            {
+                quoted = !quoted;
+                continue;
+            }
+            if (ch == ',' && !quoted)
+            {
+                cells.Add(current.ToString().Trim());
+                current.Clear();
+                continue;
+            }
+            current.Append(ch);
+        }
+        cells.Add(current.ToString().Trim());
+        return cells;
+    }
+}
+
+public static class Marking
+{
+    public static int Score(Sitting sitting)
+    {
+        var total = 0;
+        foreach (var question in sitting.Assessment!.Questions)
+        {
+            var answer = sitting.Answers.FirstOrDefault(a => a.QuestionId == question.Id);
+            var awarded = answer is null ? 0 : Award(question, answer.Response);
+            if (answer is not null)
+                answer.Awarded = awarded;
+            total += awarded;
+        }
+        return total;
+    }
+
+    private static int Award(Question question, string response)
+    {
+        if (question.Type == "mcq")
+            return string.Equals(response.Trim(), question.Answer, StringComparison.OrdinalIgnoreCase) ? question.Marks : 0;
+
+        var left = Words(response);
+        var right = Words(question.Answer);
+        if (left.Count == 0 || right.Count == 0)
+            return 0;
+        var overlap = left.Intersect(right).Count();
+        return overlap >= right.Count * 0.6 ? question.Marks : 0;
+    }
+
+    private static HashSet<string> Words(string value) =>
+        value.ToLowerInvariant()
+            .Split([' ', ',', '.', ';', ':', '?', '!'], StringSplitOptions.RemoveEmptyEntries)
+            .Where(word => word.Length > 3)
+            .ToHashSet();
+}
+
+public static class SittingView
+{
+    public static Task<object> Build(AppDb db, Sitting sitting, DateTimeOffset now)
+    {
+        var remaining = sitting.EndsAt - now;
+        if (remaining < TimeSpan.Zero)
+            remaining = TimeSpan.Zero;
+        var phase = sitting.Status == SittingStatus.InProgress
+            ? ExamClock.Phase(sitting.EndsAt - now)
+            : ClockPhase.Ended;
+
+        return Task.FromResult<object>(new
+        {
+            id = sitting.Id,
+            assessmentId = sitting.AssessmentId,
+            title = sitting.Assessment?.Title ?? "",
+            durationMinutes = sitting.Assessment?.DurationMinutes ?? 0,
+            status = sitting.Status,
+            score = sitting.Status == SittingStatus.InProgress ? (int?)null : sitting.Score,
+            maxScore = sitting.MaxScore,
+            startedAt = sitting.StartedAt,
+            endsAt = sitting.EndsAt,
+            serverNow = now,
+            remainingSeconds = (int)Math.Ceiling(remaining.TotalSeconds),
+            phase = phase.ToString().ToLowerInvariant(),
+            questions = sitting.Assessment?.Questions
+                .OrderBy(q => q.Id)
+                .Select(q => new
+                {
+                    id = q.Id,
+                    type = q.Type,
+                    prompt = q.Prompt,
+                    options = JsonSerializer.Deserialize<List<string>>(q.OptionsJson) ?? [],
+                    marks = q.Marks,
+                    response = sitting.Answers.FirstOrDefault(a => a.QuestionId == q.Id)?.Response ?? ""
+                })
+        });
+    }
+}
+
+public static class AssessmentView
+{
+    public static object From(Assessment assessment, bool includeKey, Sitting? sitting = null, bool invigilating = false) => new
+    {
+        id = assessment.Id,
+        title = assessment.Title,
+        durationMinutes = assessment.DurationMinutes,
+        questionCount = assessment.Questions.Count,
+        maxScore = assessment.Questions.Sum(q => q.Marks),
+        invigilating,
+        sitting = sitting is null ? null : new
+        {
+            id = sitting.Id,
+            status = sitting.Status,
+            score = sitting.Status == SittingStatus.InProgress ? (int?)null : sitting.Score,
+            maxScore = sitting.MaxScore
+        },
+        questions = includeKey
+            ? assessment.Questions.OrderBy(q => q.Id).Select(q => new
+            {
+                id = q.Id,
+                type = q.Type,
+                prompt = q.Prompt,
+                options = JsonSerializer.Deserialize<List<string>>(q.OptionsJson) ?? [],
+                answer = q.Answer,
+                marks = q.Marks
+            })
+            : null
+    };
+}
+
+public static class UserView
+{
+    public static object From(UserAccount user) => new
+    {
+        id = user.Id,
+        fullName = user.FullName,
+        email = user.Email,
+        role = user.Role
+    };
+}
+
+public static class Passwords
+{
+    public static string Hash(string password)
+    {
+        var salt = RandomNumberGenerator.GetBytes(16);
+        var hash = Rfc2898DeriveBytes.Pbkdf2(password, salt, 100_000, HashAlgorithmName.SHA256, 32);
+        return $"{Convert.ToHexString(salt)}.{Convert.ToHexString(hash)}";
+    }
+
+    public static bool Verify(string password, string stored)
+    {
+        var parts = stored.Split('.');
+        if (parts.Length != 2)
+            return false;
+        var salt = Convert.FromHexString(parts[0]);
+        var expected = Convert.FromHexString(parts[1]);
+        var actual = Rfc2898DeriveBytes.Pbkdf2(password, salt, 100_000, HashAlgorithmName.SHA256, 32);
+        return CryptographicOperations.FixedTimeEquals(actual, expected);
+    }
+}
+
+public static class Seed
+{
+    public static async Task Ensure(AppDb db)
+    {
+        await AddIfMissing(db, "Leila Nansubuga", "leila.nansubuga@rms.local", "teacher", "Harbor-Teach-19");
+        await AddIfMissing(db, "Jamal Ssebunya", "jamal.ssebunya@rms.local", "student", "Harbor-Study-19");
+        await AddIfMissing(db, "Samuel Kato", "samuel.kato@rms.local", "invigilator", "Harbor-Watch-19");
+        await AddIfMissing(db, "Ada Okello", "ada.okello@rms.local", "superadmin", "Harbor-Admin-19");
+        await AddIfMissing(db, "System Admin", "system.admin@rms.local", "systemadmin", "Harbor-System-19");
+        await db.SaveChangesAsync();
+
+        var samuel = await db.Users.FirstAsync(user => user.Email == "samuel.kato@rms.local");
+        var jamal = await db.Users.FirstAsync(user => user.Email == "jamal.ssebunya@rms.local");
+        if (!await db.Assignments.AnyAsync(item => item.StudentId == jamal.Id))
+        {
+            db.Assignments.Add(new Assignment { StudentId = jamal.Id, InvigilatorId = samuel.Id });
+            await db.SaveChangesAsync();
+        }
+    }
+
+    private static async Task AddIfMissing(AppDb db, string name, string email, string role, string password)
+    {
+        if (await db.Users.AnyAsync(user => user.Email == email))
+            return;
+        db.Users.Add(new UserAccount { FullName = name, Email = email, Role = role, PasswordHash = Passwords.Hash(password) });
+    }
+}

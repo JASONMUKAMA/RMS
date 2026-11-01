@@ -1,0 +1,685 @@
+import { useEffect, useRef, useState } from "react";
+import { HubConnectionBuilder } from "@microsoft/signalr";
+import { api } from "./api";
+import { openPublisher } from "./liveDesk";
+import { loadWatchers, readPosture } from "./watchPose";
+
+const WARM_SECONDS = 20 * 60;
+const HEAVY_SECONDS = 5 * 60;
+
+function phaseFor(seconds, status) {
+  if (status !== "in_progress") return "ended";
+  if (seconds <= 0) return "ended";
+  if (seconds <= HEAVY_SECONDS) return "heavy";
+  if (seconds <= WARM_SECONDS) return "warm";
+  return "running";
+}
+
+function formatClock(seconds) {
+  const safe = Math.max(0, seconds);
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const rest = safe % 60;
+  const pad = (value) => String(value).padStart(2, "0");
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(rest)}` : `${pad(minutes)}:${pad(rest)}`;
+}
+
+function remainingFrom(sync, nowMs) {
+  const ends = new Date(sync.endsAt).getTime();
+  const server = new Date(sync.serverNow).getTime();
+  const skew = server - sync.receivedAt;
+  return Math.max(0, Math.ceil((ends - (nowMs + skew)) / 1000));
+}
+
+async function openCamera() {
+  const attempts = [
+    { video: { facingMode: "user", width: { ideal: 640 } }, audio: false },
+    { video: true, audio: false }
+  ];
+  let last;
+  for (const constraints of attempts) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      last = err;
+      if (err?.name === "NotAllowedError" || err?.name === "NotReadableError") throw err;
+    }
+  }
+  throw last ?? new Error("The camera did not start.");
+}
+
+function cameraFailure(err) {
+  if (err?.name === "NotAllowedError") return "The browser blocked the camera. Allow it in the address bar, then try again.";
+  if (err?.name === "NotReadableError") return "The camera is already open in another window. Close that window, then try again.";
+  if (err?.name === "NotFoundError") return "This browser cannot find a camera. Connect one, then try again.";
+  return "The camera did not start. Close any other window using it, then try again.";
+}
+
+function alarm() {
+  try {
+    const context = new AudioContext();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = "square";
+    oscillator.frequency.value = 220;
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    gain.gain.setValueAtTime(0.12, context.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.7);
+    oscillator.start();
+    oscillator.stop(context.currentTime + 0.7);
+    oscillator.onended = () => context.close();
+  } catch {
+    // The browser blocked the tone. The warning on screen still stands.
+  }
+}
+
+function tone(kind) {
+  const context = new AudioContext();
+  const oscillator = context.createOscillator();
+  const gain = context.createGain();
+  oscillator.connect(gain);
+  gain.connect(context.destination);
+  if (kind === "warm") {
+    oscillator.frequency.value = 494;
+    gain.gain.value = 0.03;
+    oscillator.start();
+    oscillator.stop(context.currentTime + 0.22);
+  } else {
+    oscillator.type = "square";
+    oscillator.frequency.value = 311;
+    gain.gain.setValueAtTime(0.07, context.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.45);
+    oscillator.start();
+    oscillator.stop(context.currentTime + 0.45);
+  }
+  oscillator.onended = () => context.close();
+}
+
+export default function ExamRoom({ sittingId, onLeave }) {
+  const [sync, setSync] = useState(null);
+  const [remaining, setRemaining] = useState(0);
+  const [error, setError] = useState("");
+  const [camera, setCamera] = useState("ask");
+  const [cameraError, setCameraError] = useState("");
+  const [watch, setWatch] = useState("Waiting for the preview.");
+  const [models, setModels] = useState("loading");
+  const watchersRef = useRef(null);
+  const [hand, setHand] = useState("down");
+  const [note, setNote] = useState("");
+  const [localAlert, setLocalAlert] = useState("");
+  const [away, setAway] = useState(false);
+  const [lookAway, setLookAway] = useState(false);
+  const lookAwayRef = useRef(false);
+  const [leaveAsk, setLeaveAsk] = useState(false);
+  const [opened, setOpened] = useState(false);
+  const awayRef = useRef(false);
+  const heard = useRef("running");
+  const expiring = useRef(false);
+  const streamRef = useRef(null);
+  const videoRef = useRef(null);
+  const hubRef = useRef(null);
+  const reportRef = useRef(() => {});
+  const viewerPeers = useRef(new Map());
+  const earlyIce = useRef(new Map());
+  const pendingOffers = useRef(new Map());
+  const answerViewerRef = useRef(() => {});
+
+  async function refresh() {
+    const body = await api(`/api/sittings/${sittingId}`);
+    setSync({ ...body, receivedAt: Date.now() });
+    return body;
+  }
+
+  useEffect(() => {
+    refresh().catch((err) => setError(err.message));
+    const poll = setInterval(() => refresh().catch(() => {}), 4000);
+    const connection = new HubConnectionBuilder().withUrl("/hubs/desk").withAutomaticReconnect().build();
+    hubRef.current = connection;
+    connection.on("expired", () => refresh().catch(() => {}));
+    connection.on("handSeen", () => setHand("seen"));
+    connection.on("watching", (open) => setOpened(Boolean(open)));
+    connection.on("viewerOffer", (viewerId, sdp) => answerViewerRef.current(viewerId, sdp));
+    connection.on("viewerIce", (viewerId, raw) => {
+      const candidate = JSON.parse(raw);
+      const publisher = viewerPeers.current.get(viewerId);
+      if (!publisher) {
+        const queued = earlyIce.current.get(viewerId) || [];
+        queued.push(candidate);
+        earlyIce.current.set(viewerId, queued);
+        return;
+      }
+      publisher.addIce(candidate);
+    });
+    connection.start().then(() => connection.invoke("JoinSitting", sittingId)).catch(() => {});
+    return () => {
+      clearInterval(poll);
+      hubRef.current = null;
+      for (const publisher of viewerPeers.current.values()) publisher.close();
+      viewerPeers.current.clear();
+      connection.stop();
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, [sittingId]);
+
+  useEffect(() => {
+    if (!sync) return undefined;
+    const tick = () => {
+      const next = remainingFrom(sync, Date.now());
+      setRemaining((current) => current === next ? current : next);
+    };
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [sync?.endsAt, sync?.serverNow, sync?.receivedAt]);
+
+  const phase = sync ? phaseFor(remaining, sync.status) : "running";
+
+  useEffect(() => {
+    if (!sync || sync.status !== "in_progress") return;
+    if (phase === heard.current) return;
+    if (phase === "warm" || phase === "heavy") tone(phase);
+    heard.current = phase;
+  }, [phase, sync]);
+
+  useEffect(() => {
+    if (!sync || sync.status !== "in_progress" || remaining > 0 || expiring.current) return;
+    expiring.current = true;
+    api(`/api/sittings/${sittingId}/expire`, { method: "POST" })
+      .then((body) => setSync({ ...body, receivedAt: Date.now() }))
+      .catch((err) => setError(err.message));
+  }, [remaining, sync, sittingId]);
+
+  useEffect(() => {
+    const stillAt = {};
+    const cameraKinds = new Set(["face-missing", "second-face", "head-away", "hand-ear"]);
+    reportRef.current = (kind) => {
+      setLocalAlert(kind);
+      hubRef.current?.invoke("ReportSignal", sittingId, kind).catch(() => {});
+      if (!cameraKinds.has(kind)) return;
+      const now = Date.now();
+      if (stillAt[kind] && now - stillAt[kind] < 60000) return;
+      const video = videoRef.current;
+      if (!video || video.videoWidth === 0) return;
+      stillAt[kind] = now;
+      const width = Math.min(640, video.videoWidth);
+      const height = Math.max(1, Math.round(video.videoHeight * (width / video.videoWidth)));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext("2d", { alpha: false })?.drawImage(video, 0, 0, width, height);
+      canvas.toBlob((blob) => {
+        if (!blob) return;
+        fetch(`/api/sittings/${sittingId}/still?kind=${encodeURIComponent(kind)}`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "image/jpeg" },
+          body: blob
+        }).catch(() => {});
+      }, "image/jpeg", 0.7);
+    };
+  }, [sittingId]);
+
+  useEffect(() => {
+    if (sync?.status !== "in_progress") return undefined;
+    const markAway = () => {
+      if (awayRef.current) return;
+      awayRef.current = true;
+      setAway(true);
+      reportRef.current("window");
+      alarm();
+    };
+    const onHide = () => { if (document.hidden) markAway(); };
+    let blurTimer = 0;
+    const onBlur = () => {
+      window.clearTimeout(blurTimer);
+      blurTimer = window.setTimeout(() => {
+        if (document.hidden || !document.hasFocus()) markAway();
+      }, 200);
+    };
+    const onBeforeUnload = (event) => {
+      event.preventDefault();
+      event.returnValue = "You are leaving the exam window. This is recorded. Stay here until you submit.";
+    };
+    const onCopy = () => reportRef.current("copy");
+    const onPaste = () => reportRef.current("paste");
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("beforeunload", onBeforeUnload);
+    document.addEventListener("copy", onCopy);
+    document.addEventListener("paste", onPaste);
+    return () => {
+      window.clearTimeout(blurTimer);
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("beforeunload", onBeforeUnload);
+      document.removeEventListener("copy", onCopy);
+      document.removeEventListener("paste", onPaste);
+    };
+  }, [sync?.status]);
+
+  useEffect(() => {
+    if (sync?.status !== "in_progress") return undefined;
+    let alive = true;
+    loadWatchers()
+      .then((loaded) => {
+        if (!alive) return;
+        watchersRef.current = loaded;
+        setModels("ready");
+      })
+      .catch(() => {
+        if (alive) setModels("failed");
+      });
+    return () => { alive = false; };
+  }, [sync?.status]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    const stream = streamRef.current;
+    if (camera !== "live" || !video || !stream) return undefined;
+    video.srcObject = stream;
+    let missingSince = 0;
+    let secondSince = 0;
+    let headSince = 0;
+    let earSince = 0;
+    const reported = { missing: false, second: false, head: false, ear: false };
+    let busy = false;
+    let stopped = false;
+    if (models === "failed") setWatch("The camera models did not start. The preview is on.");
+    else if (models !== "ready") setWatch("Loading face and posture models…");
+    else setWatch("Looking for a face");
+    const markLook = (next) => {
+      if (lookAwayRef.current === next) return;
+      lookAwayRef.current = next;
+      setLookAway(next);
+    };
+    const hold = (active, since, reportedKey, limit, signal) => {
+      if (!active) {
+        reported[reportedKey] = false;
+        return 0;
+      }
+      const started = since || Date.now();
+      if (Date.now() - started >= limit && !reported[reportedKey]) {
+        reported[reportedKey] = true;
+        reportRef.current(signal);
+      }
+      return started;
+    };
+    const tick = () => {
+      const watchers = watchersRef.current;
+      if (stopped || busy || !watchers || video.readyState < 2) return;
+      busy = true;
+      try {
+        const posture = readPosture(watchers, video, performance.now());
+        if (!posture) return;
+        if (posture.faceCount === 0) {
+          secondSince = 0;
+          headSince = 0;
+          earSince = 0;
+          reported.second = false;
+          reported.head = false;
+          reported.ear = false;
+          missingSince = hold(true, missingSince, "missing", 5000, "face-missing");
+          if (missingSince && Date.now() - missingSince >= 800) markLook("missing");
+          setWatch(missingSince && Date.now() - missingSince >= 5000 ? "Face missing" : "Looking for a face");
+        } else if (posture.faceCount > 1) {
+          missingSince = 0;
+          headSince = 0;
+          earSince = 0;
+          reported.missing = false;
+          reported.head = false;
+          reported.ear = false;
+          secondSince = hold(true, secondSince, "second", 3000, "second-face");
+          markLook(false);
+          setWatch(secondSince && Date.now() - secondSince >= 3000 ? "Second face" : "More than one face");
+        } else {
+          missingSince = 0;
+          secondSince = 0;
+          reported.missing = false;
+          reported.second = false;
+          headSince = hold(posture.headAway, headSince, "head", 5000, "head-away");
+          earSince = hold(posture.handEar, earSince, "ear", 3000, "hand-ear");
+          markLook(posture.headAway && headSince && Date.now() - headSince >= 400 ? "head" : false);
+          const headHeld = posture.headAway && headSince && Date.now() - headSince >= 5000;
+          const earHeld = posture.handEar && earSince && Date.now() - earSince >= 3000;
+          const label = headHeld ? "Head turned away" : earHeld ? "Hand at ear" : posture.headAway ? "Head turning away" : posture.handEar ? "Hand moving to an ear" : "One face, looking at the paper";
+          setWatch(label);
+        }
+      } catch {
+        setWatch("Face watch is waiting for the preview.");
+      } finally {
+        busy = false;
+      }
+    };
+    const timer = setInterval(tick, 500);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+      lookAwayRef.current = false;
+      setLookAway(false);
+    };
+  }, [camera, models]);
+
+  useEffect(() => {
+    if (!lookAway || sync?.status !== "in_progress") return undefined;
+    const kind = lookAway === "missing" ? "face-missing" : "head-away";
+    api(`/api/sittings/${sittingId}/warning`, { method: "POST", body: JSON.stringify({ kind }) }).catch(() => {});
+  }, [lookAway, sittingId, sync?.status]);
+
+  useEffect(() => {
+    if (sync?.status !== "submitted" && sync?.status !== "expired") return undefined;
+    api(`/api/sittings/${sittingId}/summary`, { method: "POST" }).catch(() => {});
+  }, [sync?.status, sittingId]);
+
+  useEffect(() => {
+    if (!lookAway) return undefined;
+    const blare = () => {
+      alarm();
+      const utterance = new SpeechSynthesisUtterance(lookAway === "missing" ? "Face the paper." : "Look at the paper.");
+      utterance.rate = 1.05;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utterance);
+    };
+    blare();
+    const timer = setInterval(blare, 2200);
+    return () => {
+      clearInterval(timer);
+      window.speechSynthesis.cancel();
+    };
+  }, [lookAway]);
+
+  useEffect(() => {
+    if (camera !== "live" || models === "loading") return undefined;
+    const canvas = document.createElement("canvas");
+    let sending = false;
+    let pending = false;
+    const send = () => {
+      if (sending) {
+        pending = true;
+        return;
+      }
+      sending = true;
+      canvas.toBlob((blob) => {
+        const done = () => {
+          sending = false;
+          if (pending) {
+            pending = false;
+            send();
+          }
+        };
+        if (!blob) {
+          done();
+          return;
+        }
+        fetch(`/api/sittings/${sittingId}/frame`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "image/jpeg" },
+          body: blob
+        }).then(done, done);
+      }, "image/jpeg", 0.4);
+    };
+    let timer = 0;
+    const begin = window.setTimeout(() => {
+      timer = window.setInterval(() => {
+        const video = videoRef.current;
+        if (!video || video.videoWidth === 0) return;
+        const width = 320;
+        const height = Math.max(1, Math.round(video.videoHeight * (width / video.videoWidth)));
+        if (canvas.width !== width) {
+          canvas.width = width;
+          canvas.height = height;
+        }
+        const context = canvas.getContext("2d", { alpha: false });
+        if (!context) return;
+        context.drawImage(video, 0, 0, width, height);
+        send();
+      }, 40);
+    }, models === "ready" ? 600 : 0);
+    return () => {
+      window.clearTimeout(begin);
+      window.clearInterval(timer);
+    };
+  }, [camera, models, sittingId]);
+
+  useEffect(() => {
+    answerViewerRef.current = (viewerId, sdp) => {
+      const stream = streamRef.current;
+      const connection = hubRef.current;
+      if (camera !== "live" || !stream || !connection) {
+        pendingOffers.current.set(viewerId, sdp);
+        return;
+      }
+      viewerPeers.current.get(viewerId)?.close();
+      const queued = earlyIce.current.get(viewerId) || [];
+      earlyIce.current.delete(viewerId);
+      const publisher = openPublisher(connection, sittingId, viewerId, stream, queued);
+      viewerPeers.current.set(viewerId, publisher);
+      publisher.start(sdp).catch(() => {});
+    };
+    if (camera === "live") {
+      const waiting = [...pendingOffers.current.entries()];
+      pendingOffers.current.clear();
+      for (const [viewerId, sdp] of waiting) answerViewerRef.current(viewerId, sdp);
+    }
+  }, [camera, sittingId]);
+
+  async function allowCamera() {
+    setCameraError("");
+    try {
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      const stream = await openCamera();
+      stream.getVideoTracks().forEach((track) => {
+        track.onended = () => {
+          setCamera("lost");
+          reportRef.current("camera-interrupted");
+        };
+      });
+      streamRef.current = stream;
+      setCamera("live");
+    } catch (err) {
+      setCameraError(cameraFailure(err));
+    }
+  }
+
+  async function save(questionId, response) {
+    const body = await api(`/api/sittings/${sittingId}/answers`, {
+      method: "PUT",
+      body: JSON.stringify({ questionId, response })
+    });
+    setSync({ ...body, receivedAt: Date.now() });
+  }
+
+  async function submit() {
+    try {
+      const body = await api(`/api/sittings/${sittingId}/submit`, { method: "POST" });
+      setSync({ ...body, receivedAt: Date.now() });
+    } catch (err) {
+      if (err.body?.status) {
+        const body = await api(`/api/sittings/${sittingId}`);
+        setSync({ ...body, receivedAt: Date.now() });
+      }
+      setError(err.message);
+    }
+  }
+
+  async function raiseHand() {
+    if (!hubRef.current) throw new Error("The desk is not connected yet.");
+    await hubRef.current.invoke("RaiseHand", sittingId, note);
+    setHand("up");
+  }
+
+  if (!sync) return <p className="grid min-h-screen place-items-center text-stone-500">Opening the paper…</p>;
+
+  if (sync.status === "expired" || sync.status === "submitted") {
+    const expired = sync.status === "expired";
+    return (
+      <section className="grid min-h-screen place-items-center bg-stone-100 px-6">
+        <div className="max-w-lg rounded-3xl bg-white p-8 shadow-xl">
+          <p className="text-sm text-stone-500">{expired ? "Time is up" : "Submitted in time"}</p>
+          <h1 className="mt-2 font-serif text-5xl">{expired ? "No marks" : `${sync.score} / ${sync.maxScore}`}</h1>
+          <p className="mt-3 text-stone-600">{expired ? "The clock ended before this paper was submitted, so the score is 0." : "These marks stand because the paper was submitted before the clock ended."}</p>
+          <button className="mt-6 rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50" type="button" onClick={onLeave}>Back to papers</button>
+        </div>
+      </section>
+    );
+  }
+
+  const clockTone = phase === "heavy" ? "text-red-700" : phase === "warm" ? "text-amber-700" : "text-stone-950";
+  const alertCopy = {
+    window: "Recorded: you left the exam window.",
+    copy: "Recorded: a copy from this paper.",
+    paste: "Recorded: a paste into this paper.",
+    "face-missing": "Recorded: the face is missing.",
+    "second-face": "Recorded: a second face is in the camera.",
+    "head-away": "Recorded: the head stayed turned away.",
+    "hand-ear": "Recorded: a hand stayed at an ear.",
+    "camera-interrupted": "Recorded: the camera stopped."
+  };
+
+  return (
+    <main className="min-h-screen bg-stone-100 text-stone-900">
+      <div className="sticky top-0 z-20 flex flex-wrap items-center justify-between gap-4 border-b border-stone-200 bg-white/95 px-5 py-4 backdrop-blur">
+        <div>
+          <button className="rounded-full border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700 hover:bg-stone-50" type="button" onClick={() => setLeaveAsk(true)}>Leave exam</button>
+          <div className="mt-1 text-sm text-stone-500">{sync.title}</div>
+          <div className={`font-serif text-5xl tabular-nums ${clockTone}`}>{formatClock(remaining)}</div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            className="rounded-full border border-stone-300 px-3 py-2 text-sm"
+            placeholder="Optional note"
+            value={note}
+            onChange={(event) => setNote(event.target.value)}
+            disabled={camera !== "live"}
+          />
+          <button className="rounded-full bg-red-700 px-5 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-red-800 disabled:cursor-not-allowed disabled:opacity-40" type="button" disabled={camera !== "live" || hand === "up"} onClick={() => raiseHand().catch((err) => setError(err.message))}>Raise hand</button>
+          <button className="rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50 shadow-sm transition hover:bg-stone-800" type="button" onClick={submit}>Submit paper</button>
+        </div>
+      </div>
+      {phase === "warm" && (
+        <div className="bg-amber-100 px-5 py-3 text-amber-950" role="status">
+          <strong>Less than twenty minutes remain.</strong> There is still time. Submit before the clock ends. An unsubmitted paper receives no marks.
+        </div>
+      )}
+      {phase === "heavy" && (
+        <div className="bg-red-100 px-5 py-3 text-red-900" role="alert">
+          <strong>Less than five minutes remain.</strong> Submit now. When the clock hits zero, this paper closes with no marks.
+        </div>
+      )}
+      {hand === "up" && <div className="bg-red-700 px-5 py-3 text-white" role="status">Your hand is up.</div>}
+      {hand === "seen" && <div className="bg-emerald-700 px-5 py-3 text-white" role="status">The invigilator has seen your hand.</div>}
+      {opened && <div className="bg-stone-950 px-5 py-3 text-stone-100" role="status">An invigilator has opened your camera.</div>}
+      {localAlert && <div className="bg-amber-50 px-5 py-2 text-sm text-amber-950">{alertCopy[localAlert]}</div>}
+      {error && <p className="px-5 py-2 text-sm text-red-700">{error}</p>}
+
+      {camera !== "live" ? (
+        <section className="mx-auto mt-10 max-w-xl rounded-3xl bg-white p-8 shadow-xl">
+          <p className="text-xs tracking-[0.16em] text-amber-800">CAMERA</p>
+          <h1 className="mt-2 font-serif text-4xl">{camera === "lost" ? "The camera stopped" : "Turn the camera on"}</h1>
+          <p className="mt-3 text-stone-600">
+            This sitting records leaving the window, copy, paste, and this camera. The invigilator sees the preview with your name. The microphone stays off. The questions open when the preview is live.
+            {camera === "lost" ? " The clock is still running." : ""}
+          </p>
+          <p className="mt-3 text-sm text-stone-500">Face and posture models run in this browser. A missing face, a second face, a head turned away, or a hand at an ear is recorded after it holds. The first time each one holds, one still is kept. Short answers of 30 characters or more are compared on the server.</p>
+          <p className="mt-3 text-sm font-medium text-stone-800">{models === "ready" ? "Face and posture models are ready." : models === "failed" ? "The camera models did not start. The preview can still go on." : "Loading face and posture models…"}</p>
+          {cameraError && <p className="mt-3 text-sm text-red-700">{cameraError}</p>}
+          <button className="mt-6 rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50 shadow-sm hover:bg-stone-800" type="button" onClick={allowCamera}>Allow camera</button>
+        </section>
+      ) : (
+        <div className="mx-auto max-w-3xl px-5 py-6">
+          {sync.questions.map((question, index) => (
+            <article className="mb-4 rounded-3xl bg-white p-5 shadow-sm" key={question.id}>
+              <h2 className="font-serif text-2xl">{index + 1}. {question.prompt}</h2>
+              <p className="mt-1 text-sm text-stone-500">{question.marks} mark{question.marks === 1 ? "" : "s"}</p>
+              {question.type === "mcq" ? (
+                <div className="mt-3 space-y-2">
+                  {question.options.map((option, optionIndex) => {
+                    const letter = String.fromCharCode(65 + optionIndex);
+                    return (
+                      <label className="flex items-center gap-3 rounded-2xl border border-stone-200 px-3 py-2" key={letter}>
+                        <input
+                          type="radio"
+                          name={`q-${question.id}`}
+                          checked={question.response === letter}
+                          onChange={() => save(question.id, letter).catch((err) => setError(err.message))}
+                        />
+                        <span>{letter}. {option}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              ) : (
+                <textarea
+                  className="mt-3 w-full rounded-2xl border border-stone-300 px-3 py-2"
+                  value={question.response}
+                  onChange={(event) => {
+                    const response = event.target.value;
+                    setSync({
+                      ...sync,
+                      questions: sync.questions.map((item) => item.id === question.id ? { ...item, response } : item)
+                    });
+                  }}
+                  onBlur={(event) => save(question.id, event.target.value).catch((err) => setError(err.message))}
+                />
+              )}
+            </article>
+          ))}
+        </div>
+      )}
+
+      {lookAway && (
+        <div className="pointer-events-none fixed inset-0 z-40 grid place-items-center bg-red-700 px-6 text-center text-white" role="alert">
+          <div>
+            <p className="text-sm font-medium tracking-[0.22em]">NOT LOOKING AT THE PAPER</p>
+            <h2 className="mt-3 font-serif text-6xl leading-none">Look at the paper</h2>
+            <p className="mx-auto mt-4 max-w-xl text-xl">
+              {lookAway === "missing"
+                ? "Your face is out of the camera. This is being recorded. The warning stops when your face is back."
+                : "Your head is turned away. This is being recorded. The warning stops when you look back at the screen."}
+            </p>
+          </div>
+        </div>
+      )}
+      {away && (
+        <div className="fixed inset-0 z-50 grid place-items-center bg-red-950/90 px-6" role="alertdialog" aria-modal="true" aria-labelledby="away-title">
+          <div className="w-full max-w-lg rounded-3xl bg-white p-8 shadow-2xl">
+            <p className="text-xs font-medium tracking-[0.16em] text-red-700">EXAM WINDOW</p>
+            <h2 id="away-title" className="mt-2 font-serif text-4xl text-red-800">You left this window</h2>
+            <p className="mt-3 text-stone-700">This is recorded. The invigilator can see that you left the exam. Stay in this window until you submit. The clock is still running, and an unsubmitted paper scores nothing.</p>
+            <button
+              className="mt-6 w-full rounded-full bg-red-700 px-5 py-3 text-sm font-medium text-white hover:bg-red-800"
+              type="button"
+              onClick={() => {
+                awayRef.current = false;
+                setAway(false);
+              }}
+            >
+              I am back. Continue the exam
+            </button>
+          </div>
+        </div>
+      )}
+      {leaveAsk && (
+        <div className="fixed inset-0 z-40 grid place-items-center bg-stone-950/70 px-6" role="alertdialog" aria-modal="true" aria-labelledby="leave-title">
+          <div className="w-full max-w-lg rounded-3xl bg-white p-8 shadow-2xl">
+            <h2 id="leave-title" className="font-serif text-4xl">Leave this exam?</h2>
+            <p className="mt-3 text-stone-700">The clock keeps running. Leaving the window is recorded, and a paper that is still open when the clock ends scores nothing.</p>
+            <div className="mt-6 flex flex-wrap gap-2">
+              <button className="rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50 hover:bg-stone-800" type="button" onClick={() => setLeaveAsk(false)}>Stay on the paper</button>
+              <button className="rounded-full border border-red-300 px-5 py-2.5 text-sm font-medium text-red-800 hover:bg-red-50" type="button" onClick={onLeave}>Leave anyway</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {camera === "live" && (
+        <div className="fixed bottom-4 right-4 w-52 overflow-hidden rounded-2xl bg-stone-950 text-stone-100 shadow-2xl">
+          <video ref={videoRef} autoPlay muted playsInline className="aspect-video w-full object-cover" />
+          <p className="px-3 py-2 text-xs">Your camera is on the invigilator desk.</p>
+          <p className="px-3 pb-3 text-xs text-amber-200">{watch}</p>
+        </div>
+      )}
+    </main>
+  );
+}

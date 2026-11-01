@@ -1,0 +1,12 @@
+.git
+**/.vs
+**/.idea
+**/.vscode
+**/bin
+**/obj
+**/node_modules
+frontend/dist
+backend/RMS.Api/data
+*.user
+*.sql
+*.md

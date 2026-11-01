@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Outfit", "Segoe UI", sans-serif;
+  --font-serif: "Fraunces", Georgia, serif;
+}
+
+body {
+  margin: 0;
+}
+
+button, input, textarea, select {
+  font: inherit;
+}
+
+.dataTables_wrapper {
+  color: #1c1917;
+}
+
+.dataTables_wrapper .dt-search input,
+.dataTables_wrapper .dt-input,
+.dataTables_wrapper select {
+  border: 1px solid #d6d3d1;
+  border-radius: 0.75rem;
+  padding: 0.45rem 0.75rem;
+  background: white;
+}
+
+.dataTables_wrapper table.dataTable {
+  width: 100% !important;
+  background: white;
+  border-radius: 1rem;
+  overflow: hidden;
+}
+
+table.dataTable thead th {
+  background: #1c1917;
+  color: #fafaf9;
+  font-weight: 560;
+  padding: 0.8rem 0.9rem !important;
+  border: 0 !important;
+}
+
+table.dataTable tbody tr.summary-check td {
+  background: #fee2e2;
+}
+
+table.dataTable tbody td {
+  padding: 0.8rem 0.9rem !important;
+  border-bottom: 1px solid #e7e5e4 !important;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: none; }
+}
+
+.toast-in {
+  animation: toast-in 0.18s ease-out;
+}
+
+@keyframes hand-wave {
+  0%, 100% { transform: rotate(0deg); }
+  30% { transform: rotate(16deg); }
+  60% { transform: rotate(-8deg); }
+}
+
+.hand-wave {
+  transform-origin: 70% 90%;
+  animation: hand-wave 0.7s ease-in-out infinite;
+}
+
+.dataTables_wrapper .dt-layout-row {
+  margin: 0.75rem 0;
+  gap: 0.75rem;
+}

@@ -1,0 +1,13 @@
+services:
+  rms:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+    volumes:
+      - rms-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  rms-data:
