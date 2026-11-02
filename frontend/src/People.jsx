@@ -86,16 +86,95 @@ export function JoinWizard({ onDone, onBack }) {
     phone: "",
     nin: "",
     address: "",
+    villageId: "",
     dateOfBirth: "",
     password: ""
   });
+  const [places, setPlaces] = useState(null);
+  const [counties, setCounties] = useState([]);
+  const [subcounties, setSubcounties] = useState([]);
+  const [parishes, setParishes] = useState([]);
+  const [villages, setVillages] = useState([]);
+  const [picked, setPicked] = useState({ district: "", county: "", subcounty: "", parish: "" });
+  const [loadingPlace, setLoadingPlace] = useState("");
 
   useEffect(() => {
+    api("/api/places/summary").then(async (summary) => {
+      if (summary.villages > 0)
+        summary.districts = await api("/api/places/districts");
+      setPlaces(summary);
+    }).catch(() => setPlaces({ villages: 0 }));
     api("/api/join/addresses").then(setAddresses).catch(() => setAddresses([]));
   }, []);
 
   function set(key, value) {
     setForm((current) => ({ ...current, [key]: value }));
+  }
+
+  async function chooseDistrict(id) {
+    setPicked({ district: id, county: "", subcounty: "", parish: "" });
+    set("villageId", "");
+    setSubcounties([]);
+    setParishes([]);
+    setVillages([]);
+    if (!id) {
+      setCounties([]);
+      return;
+    }
+    setLoadingPlace("counties");
+    try {
+      setCounties(await api(`/api/places/counties?districtId=${id}`));
+    } finally {
+      setLoadingPlace("");
+    }
+  }
+
+  async function chooseCounty(id) {
+    setPicked((current) => ({ ...current, county: id, subcounty: "", parish: "" }));
+    set("villageId", "");
+    setParishes([]);
+    setVillages([]);
+    if (!id) {
+      setSubcounties([]);
+      return;
+    }
+    setLoadingPlace("subcounties");
+    try {
+      setSubcounties(await api(`/api/places/subcounties?countyId=${id}`));
+    } finally {
+      setLoadingPlace("");
+    }
+  }
+
+  async function chooseSubcounty(id) {
+    setPicked((current) => ({ ...current, subcounty: id, parish: "" }));
+    set("villageId", "");
+    setVillages([]);
+    if (!id) {
+      setParishes([]);
+      return;
+    }
+    setLoadingPlace("parishes");
+    try {
+      setParishes(await api(`/api/places/parishes?subcountyId=${id}`));
+    } finally {
+      setLoadingPlace("");
+    }
+  }
+
+  async function chooseParish(id) {
+    setPicked((current) => ({ ...current, parish: id }));
+    set("villageId", "");
+    if (!id) {
+      setVillages([]);
+      return;
+    }
+    setLoadingPlace("villages");
+    try {
+      setVillages(await api(`/api/places/villages?parishId=${id}`));
+    } finally {
+      setLoadingPlace("");
+    }
   }
 
   async function next(event) {
@@ -114,12 +193,13 @@ export function JoinWizard({ onDone, onBack }) {
       return;
     }
     if (step < 6) {
+      if (step === 4 && places?.villages > 0 && !form.villageId) return;
       setStep(step + 1);
       return;
     }
     setBusy(true);
     try {
-      const account = await api("/api/join", { method: "POST", body: JSON.stringify(form) });
+      const account = await api("/api/join", { method: "POST", body: JSON.stringify({ ...form, villageId: form.villageId ? Number(form.villageId) : null }) });
       onDone(account);
     } catch (err) {
       setError(err.message);
@@ -179,8 +259,16 @@ export function JoinWizard({ onDone, onBack }) {
           </label>
         )}
         {step === 4 && (
-          addresses.length === 0 ? (
-            <p className="mt-5 rounded-2xl bg-amber-50 px-4 py-3 text-sm text-amber-950">The system admin has not published addresses yet. You can continue once that list is on the desk.</p>
+          places?.villages > 0 ? (
+            <div className="mt-5 grid gap-4">
+              <SearchSelect label="District" value={picked.district} options={places.districts || []} loading={!places.districts} placeholder="Search districts" onChange={chooseDistrict} />
+              <SearchSelect label="County" value={picked.county} options={counties} disabled={!picked.district} loading={loadingPlace === "counties"} placeholder={picked.district ? "Search counties" : "Choose a district first"} onChange={chooseCounty} />
+              <SearchSelect label="Subcounty" value={picked.subcounty} options={subcounties} disabled={!picked.county} loading={loadingPlace === "subcounties"} placeholder={picked.county ? "Search subcounties" : "Choose a county first"} onChange={chooseSubcounty} />
+              <SearchSelect label="Parish" value={picked.parish} options={parishes} disabled={!picked.subcounty} loading={loadingPlace === "parishes"} placeholder={picked.subcounty ? "Search parishes" : "Choose a subcounty first"} onChange={chooseParish} />
+              <SearchSelect label="Village" value={form.villageId} options={villages} disabled={!picked.parish} loading={loadingPlace === "villages"} placeholder={picked.parish ? "Search villages" : "Choose a parish first"} onChange={(id) => set("villageId", id)} />
+            </div>
+          ) : addresses.length === 0 ? (
+            <p className="mt-5 rounded-2xl bg-amber-50 px-4 py-3 text-sm text-amber-950">Districts and villages are not loaded yet.</p>
           ) : (
             <label className="mt-5 block text-sm">Address
               <select className={field} required value={form.address} onChange={(event) => set("address", event.target.value)}>
@@ -204,12 +292,154 @@ export function JoinWizard({ onDone, onBack }) {
         {error && <p className="mt-3 text-sm text-red-700">{error}</p>}
         <div className="mt-6 flex flex-wrap gap-2">
           <button className={ghost} type="button" onClick={() => step === 0 ? onBack() : setStep(step - 1)}>Back</button>
-          <button className={primary} type="submit" disabled={busy || (step === 4 && addresses.length === 0)}>
+          <button className={primary} type="submit" disabled={busy || (step === 4 && places?.villages > 0 && !form.villageId) || (step === 4 && !(places?.villages > 0) && addresses.length === 0)}>
             {step === 6 ? "Create account" : "Continue"}
           </button>
         </div>
       </form>
     </main>
+  );
+}
+
+function SearchSelect({ label, value, options, onChange, placeholder = "Search", disabled = false, loading = false }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [active, setActive] = useState(0);
+  const root = useRef(null);
+  const list = useRef(null);
+  const selected = options.find((item) => String(item.id) === String(value));
+  const needle = query.trim().toLowerCase();
+  const filtered = needle ? options.filter((item) => item.name.toLowerCase().includes(needle)) : options;
+
+  useEffect(() => {
+    function outside(event) {
+      if (!root.current?.contains(event.target)) setOpen(false);
+    }
+    document.addEventListener("pointerdown", outside);
+    return () => document.removeEventListener("pointerdown", outside);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const chosen = filtered.findIndex((item) => String(item.id) === String(value));
+    setActive(needle ? 0 : Math.max(chosen, 0));
+  }, [needle, open]);
+
+  useEffect(() => {
+    list.current?.querySelector("[data-active='true']")?.scrollIntoView({ block: "nearest" });
+  }, [active, open, filtered.length]);
+
+  function pick(item) {
+    onChange(String(item.id));
+    setQuery("");
+    setOpen(false);
+  }
+
+  function onKey(event) {
+    if (disabled) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setOpen(true);
+      setActive((index) => Math.min(index + 1, Math.max(filtered.length - 1, 0)));
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setOpen(true);
+      setActive((index) => Math.max(index - 1, 0));
+    } else if (event.key === "Enter" && open) {
+      event.preventDefault();
+      if (filtered[active]) pick(filtered[active]);
+    } else if (event.key === "Escape") {
+      setOpen(false);
+    }
+  }
+
+  return (
+    <div ref={root} className={`relative text-sm ${open ? "z-40" : ""}`}>
+      <span className="block" id={`${label}-label`}>{label}</span>
+      <div className={`mt-1 flex items-center gap-1 rounded-xl border bg-white px-3 transition ${open ? "border-stone-900 ring-2 ring-stone-900/10" : "border-stone-300"} ${disabled ? "bg-stone-50" : ""}`}>
+        <svg className="h-4 w-4 shrink-0 text-stone-400" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          <circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" strokeWidth="1.6" />
+          <path d="M12.5 12.5 17 17" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+        <input
+          className="w-full bg-transparent py-2.5 outline-none placeholder:text-stone-400 disabled:cursor-not-allowed"
+          role="combobox"
+          aria-expanded={open}
+          aria-autocomplete="list"
+          aria-labelledby={`${label}-label`}
+          autoComplete="off"
+          disabled={disabled}
+          placeholder={selected && !open ? selected.name : placeholder}
+          value={open ? query : (selected?.name || "")}
+          onFocus={() => {
+            if (disabled) return;
+            setQuery("");
+            setOpen(true);
+          }}
+          onChange={(event) => {
+            setQuery(event.target.value);
+            setOpen(true);
+          }}
+          onKeyDown={onKey}
+        />
+        {value && !disabled && (
+          <button className="rounded-full px-1.5 text-stone-400 hover:bg-stone-100 hover:text-stone-800" type="button" aria-label={`Clear ${label}`} onClick={() => { onChange(""); setQuery(""); setOpen(false); }}>×</button>
+        )}
+        <button
+          className="rounded-full p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-800 disabled:cursor-not-allowed"
+          type="button"
+          aria-label={`Open ${label}`}
+          disabled={disabled}
+          onClick={() => setOpen((current) => !current)}
+        >
+          <svg className={`h-4 w-4 transition ${open ? "rotate-180" : ""}`} viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+            <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.17l3.71-3.94a.75.75 0 1 1 1.08 1.04l-4.25 4.5a.75.75 0 0 1-1.08 0l-4.25-4.5a.75.75 0 0 1 .02-1.06Z" clipRule="evenodd" />
+          </svg>
+        </button>
+      </div>
+      {open && !disabled && (
+        <div className="absolute z-30 mt-1 w-full overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-xl shadow-stone-300/70">
+          <ul ref={list} className="max-h-60 overflow-auto p-1" role="listbox" aria-label={label}>
+            {loading && <li className="px-3 py-2 text-stone-500">Loading…</li>}
+            {!loading && filtered.length === 0 && <li className="px-3 py-2 text-stone-500">{needle ? `Nothing matches “${query.trim()}”` : "Nothing in this list"}</li>}
+            {!loading && filtered.map((item, index) => {
+              const chosen = String(item.id) === String(value);
+              const current = index === active;
+              return (
+                <li key={item.id} role="option" aria-selected={chosen}>
+                  <button
+                    className={`flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left ${current ? "bg-stone-950 text-stone-50" : "text-stone-800 hover:bg-stone-100"}`}
+                    type="button"
+                    data-active={current}
+                    onMouseEnter={() => setActive(index)}
+                    onClick={() => pick(item)}
+                  >
+                    <span>{markMatch(item.name, needle)}</span>
+                    {chosen && <span className={current ? "text-amber-300" : "text-amber-700"}>✓</span>}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          <p className="border-t border-stone-100 px-3 py-1.5 text-xs text-stone-400">
+            {loading ? "Fetching the list" : `${filtered.length} of ${options.length}`}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function markMatch(name, needle) {
+  if (!needle) return name;
+  const index = name.toLowerCase().indexOf(needle);
+  if (index < 0) return name;
+  return (
+    <>
+      {name.slice(0, index)}
+      <mark className="rounded bg-amber-200/90 px-0.5 text-inherit">{name.slice(index, index + needle.length)}</mark>
+      {name.slice(index + needle.length)}
+    </>
   );
 }
 
@@ -229,6 +459,10 @@ function DeskShell({ me, onLogout, nav, note, children }) {
       <main className="min-w-0 px-5 py-6 md:px-8 md:py-8">{children}</main>
     </div>
   );
+}
+
+function NavLabel({ children }) {
+  return <p className="px-3 pb-1 pt-4 text-[10px] font-medium tracking-[0.18em] text-stone-500 first:pt-0">{children}</p>;
 }
 
 function NavButton({ active, onClick, children }) {
@@ -282,14 +516,19 @@ function mailLine(mail) {
 }
 
 export function SystemAdmin({ me, onLogout }) {
-  const [page, setPage] = useState("people");
+  const [page, setPage] = useState("roles");
   const toasts = useToasts();
 
   const nav = (
     <>
-      <NavButton active={page === "people"} onClick={() => setPage("people")}>People</NavButton>
-      <NavButton active={page === "invites"} onClick={() => setPage("invites")}>Email sheet</NavButton>
-      <NavButton active={page === "addresses"} onClick={() => setPage("addresses")}>Addresses</NavButton>
+      <NavLabel>Staff</NavLabel>
+      <NavButton active={page === "staff"} onClick={() => setPage("staff")}>Create staff</NavButton>
+      <NavButton active={page === "roles"} onClick={() => setPage("roles")}>Roles</NavButton>
+      <NavLabel>Candidates</NavLabel>
+      <NavButton active={page === "upload"} onClick={() => setPage("upload")}>Upload emails</NavButton>
+      <NavButton active={page === "emails"} onClick={() => setPage("emails")}>Uploaded emails</NavButton>
+      <NavLabel>Desk</NavLabel>
+      <NavButton active={page === "addresses"} onClick={() => setPage("addresses")}>Places</NavButton>
       <NavButton active={page === "mail"} onClick={() => setPage("mail")}>Outbox</NavButton>
     </>
   );
@@ -299,10 +538,12 @@ export function SystemAdmin({ me, onLogout }) {
       me={me}
       onLogout={onLogout}
       nav={nav}
-      note="Upload candidate emails, publish addresses, and set each person's role. The manager assigns a teacher to invigilate an exam."
+      note="Create staff, then set roles on the next page. Upload candidate emails, then read the sheet on its own page. The manager assigns a teacher to invigilate an exam."
     >
-      {page === "people" && <PeoplePage me={me} push={toasts.push} />}
-      {page === "invites" && <InvitePage push={toasts.push} />}
+      {page === "staff" && <StaffPage push={toasts.push} />}
+      {page === "roles" && <RolesPage me={me} push={toasts.push} />}
+      {page === "upload" && <UploadPage push={toasts.push} />}
+      {page === "emails" && <EmailListPage />}
       {page === "addresses" && <AddressPage push={toasts.push} />}
       {page === "mail" && <MailPage />}
       <Toaster toasts={toasts.toasts} onDismiss={toasts.dismiss} />
@@ -310,16 +551,26 @@ export function SystemAdmin({ me, onLogout }) {
   );
 }
 
-function PeoplePage({ me, push }) {
-  const [tick, setTick] = useState(0);
+function StaffPage({ push }) {
   return (
     <>
       <header className="mb-6">
-        <h1 className="font-serif text-4xl">People</h1>
-        <p className="mt-1 max-w-2xl text-stone-500">Create staff here. Candidates join only after their email is on the sheet.</p>
+        <h1 className="font-serif text-4xl">Create staff</h1>
+        <p className="mt-1 max-w-2xl text-stone-500">Teachers, invigilators, managers, and other system admins are created here. Candidates are not. They join from an uploaded email.</p>
       </header>
-      <StaffForm push={push} onCreated={() => setTick((value) => value + 1)} />
-      <PeopleTable key={tick} me={me} push={push} />
+      <StaffForm push={push} />
+    </>
+  );
+}
+
+function RolesPage({ me, push }) {
+  return (
+    <>
+      <header className="mb-6">
+        <h1 className="font-serif text-4xl">Roles</h1>
+        <p className="mt-1 max-w-2xl text-stone-500">Everyone with an account is listed here. Change a role or switch an account off. A person should sign in again after a role change.</p>
+      </header>
+      <PeopleTable me={me} push={push} />
     </>
   );
 }
@@ -333,9 +584,9 @@ function StaffForm({ push, onCreated }) {
     setBusy(true);
     try {
       const saved = await api("/api/people", { method: "POST", body: JSON.stringify(form) });
-      push({ tone: "success", title: "Staff account created", body: `${saved.fullName} is a ${roleLabel(saved.role)}. ${mailLine(saved.mail)}` });
+      push({ tone: "success", title: "Staff account created", body: `${saved.fullName} is a ${roleLabel(saved.role)}. ${mailLine(saved.mail)} Open Roles to change it later.` });
       setForm({ givenName: "", familyName: "", email: "", role: form.role, password: "" });
-      onCreated();
+      onCreated?.();
     } catch (err) {
       push({ tone: "error", title: "Account not created", body: err.message });
     } finally {
@@ -453,10 +704,9 @@ function PeopleTable({ me, push }) {
   return <div ref={hostRef} />;
 }
 
-function InvitePage({ push }) {
+function UploadPage({ push }) {
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
-  const [tick, setTick] = useState(0);
 
   async function upload(event) {
     event.preventDefault();
@@ -468,10 +718,9 @@ function InvitePage({ push }) {
       const response = await fetch("/api/invites/file", { method: "POST", body: data, credentials: "include" });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.error || "The sheet was not accepted.");
-      const invalid = body.invalidCount ? ` ${body.invalidCount} row${body.invalidCount === 1 ? "" : "s"} were not emails.` : "";
-      push({ tone: "success", title: "Emails uploaded", body: `${body.added} added. ${body.already} already on the desk.${invalid}` });
+      const skipped = body.invalidCount ? ` ${body.invalidCount} row${body.invalidCount === 1 ? "" : "s"} skipped${body.invalid?.length ? `: ${body.invalid.join("; ")}` : ""}.` : "";
+      push({ tone: "success", title: "Emails uploaded", body: `${body.added} added. ${body.already} already on the desk.${skipped} Open Uploaded emails to see the sheet.` });
       setFile(null);
-      setTick((value) => value + 1);
     } catch (err) {
       push({ tone: "error", title: "Upload stopped", body: err.message });
     } finally {
@@ -482,18 +731,29 @@ function InvitePage({ push }) {
   return (
     <>
       <header className="mb-6">
-        <h1 className="font-serif text-4xl">Email sheet</h1>
-        <p className="mt-1 max-w-2xl text-stone-500">Upload .xlsx or .csv with a column named email. Those people can then open the candidate wizard.</p>
+        <h1 className="font-serif text-4xl">Upload emails</h1>
+        <p className="mt-1 max-w-2xl text-stone-500">Upload .xlsx or .csv with an email column and a test column. The test is the paper title. On login, that candidate sees only those papers.</p>
       </header>
-      <form className="mb-6 rounded-3xl bg-white p-5 shadow-sm" onSubmit={upload}>
+      <form className="rounded-3xl bg-white p-5 shadow-sm" onSubmit={upload}>
         <label className="flex cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed border-stone-300 bg-stone-50 px-6 py-8 text-center">
           <span className="font-medium">{file ? file.name : "Drop the email sheet, or choose a file"}</span>
-          <span className="mt-1 text-sm text-stone-500">One column: email</span>
+          <span className="mt-1 text-sm text-stone-500">Columns: email, test</span>
           <input className="sr-only" type="file" accept=".xlsx,.csv,text/csv" onChange={(event) => setFile(event.target.files?.[0] || null)} />
         </label>
         <button className={`${primary} mt-4`} type="submit" disabled={busy || !file}>Upload emails</button>
       </form>
-      <InviteTable key={tick} />
+    </>
+  );
+}
+
+function EmailListPage() {
+  return (
+    <>
+      <header className="mb-6">
+        <h1 className="font-serif text-4xl">Uploaded emails</h1>
+        <p className="mt-1 max-w-2xl text-stone-500">Every email from the sheets, the test they will see after login, and whether they have finished the candidate wizard.</p>
+      </header>
+      <InviteTable />
     </>
   );
 }
@@ -506,7 +766,7 @@ function InviteTable() {
     const table = document.createElement("table");
     table.className = "display";
     table.style.width = "100%";
-    table.innerHTML = "<thead><tr><th>Email</th><th>Uploaded</th><th>Wizard</th></tr></thead>";
+    table.innerHTML = "<thead><tr><th>Email</th><th>Test</th><th>Uploaded</th><th>Wizard</th></tr></thead>";
     host.appendChild(table);
     let dt;
     let cancelled = false;
@@ -517,10 +777,11 @@ function InviteTable() {
         processing: false,
         autoWidth: false,
         pageLength: 8,
-        order: [[1, "desc"]],
+        order: [[2, "desc"]],
         ajax: { url: "/api/invites" },
         columns: [
           { data: "email", title: "Email" },
+          { data: "test", title: "Test", render: (value) => value || "Not set" },
           { data: "createdAt", title: "Uploaded", render: (value) => value ? new Date(value).toLocaleString() : "" },
           { data: "usedAt", title: "Wizard", render: (value) => value ? "Joined" : "Waiting" }
         ],
@@ -538,56 +799,56 @@ function InviteTable() {
 }
 
 function AddressPage({ push }) {
-  const [rows, setRows] = useState([]);
-  const [text, setText] = useState("");
+  const [summary, setSummary] = useState(null);
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState([]);
 
-  async function load() {
-    setRows(await api("/api/addresses"));
-  }
+  useEffect(() => {
+    api("/api/places/summary").then(setSummary).catch((err) => push({ tone: "error", title: "Places did not load", body: err.message }));
+  }, []);
 
-  useEffect(() => { load().catch((err) => push({ tone: "error", title: "Addresses did not load", body: err.message })); }, []);
-
-  async function add(event) {
+  async function search(event) {
     event.preventDefault();
-    const names = text.split("\n").map((line) => line.trim()).filter(Boolean);
     try {
-      const saved = await api("/api/addresses", { method: "POST", body: JSON.stringify({ names }) });
-      push({ tone: "success", title: "Addresses published", body: `${saved.added} added. Candidates choose from this list.` });
-      setText("");
-      await load();
+      setHits(await api(`/api/places/search?q=${encodeURIComponent(query)}`));
     } catch (err) {
-      push({ tone: "error", title: "Addresses not saved", body: err.message });
+      push({ tone: "error", title: "Search failed", body: err.message });
     }
   }
 
-  async function remove(id) {
-    try {
-      await api(`/api/addresses/${id}`, { method: "DELETE" });
-      await load();
-    } catch (err) {
-      push({ tone: "error", title: "Address not removed", body: err.message });
-    }
-  }
+  const counts = [
+    ["Districts", summary?.districts],
+    ["Counties", summary?.counties],
+    ["Subcounties", summary?.subcounties],
+    ["Parishes", summary?.parishes],
+    ["Villages", summary?.villages]
+  ];
 
   return (
     <>
       <header className="mb-6">
-        <h1 className="font-serif text-4xl">Addresses</h1>
-        <p className="mt-1 max-w-2xl text-stone-500">This list stays empty until you add the addresses candidates may choose. One address on each line.</p>
+        <h1 className="font-serif text-4xl">Places</h1>
+        <p className="mt-1 max-w-2xl text-stone-500">Candidates pick a district, then a county, subcounty, parish, and village. The list comes from the district file.</p>
       </header>
-      <form className="mb-6 rounded-3xl bg-white p-5 shadow-sm" onSubmit={add}>
-        <label className="block text-sm">Addresses
-          <textarea className={`${field} min-h-32`} value={text} onChange={(event) => setText(event.target.value)} placeholder={"One address on each line"} />
-        </label>
-        <button className={`${primary} mt-4`} type="submit" disabled={!text.trim()}>Publish addresses</button>
+      <div className="mb-6 grid gap-3 sm:grid-cols-5">
+        {counts.map(([label, count]) => (
+          <div key={label} className="rounded-3xl bg-white px-4 py-4 shadow-sm">
+            <p className="text-xs tracking-[0.16em] text-stone-500">{label}</p>
+            <p className="mt-2 font-serif text-3xl">{count ?? "…"}</p>
+          </div>
+        ))}
+      </div>
+      <form className="mb-4 flex flex-wrap gap-2" onSubmit={search}>
+        <input className={`${field} mt-0 min-w-64 flex-1`} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search a village" />
+        <button className={primary} type="submit" disabled={query.trim().length < 2}>Search</button>
       </form>
       <div className="overflow-hidden rounded-3xl bg-white shadow-sm">
-        {rows.length === 0 && <p className="px-4 py-6 text-stone-500">No addresses yet.</p>}
-        {rows.map((row) => (
-          <div key={row.id} className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3 last:border-0">
-            <span>{row.name}</span>
-            <button className={ghost} type="button" onClick={() => remove(row.id)}>Remove</button>
-          </div>
+        {hits.length === 0 && <p className="px-4 py-6 text-stone-500">Search finds a village and shows the parish, subcounty, county, and district above it.</p>}
+        {hits.map((hit) => (
+          <p key={`${hit.village}-${hit.parish}-${hit.subcounty}`} className="border-b border-stone-200 px-4 py-3 last:border-0">
+            <strong>{hit.village}</strong>
+            <span className="mt-1 block text-sm text-stone-500">{hit.parish}, {hit.subcounty}, {hit.county}, {hit.district}</span>
+          </p>
         ))}
       </div>
     </>

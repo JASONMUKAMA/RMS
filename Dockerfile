@@ -20,10 +20,7 @@ RUN apt-get update \
 COPY backend/RMS.Api/models ./models
 COPY --from=api /app/publish .
 COPY --from=frontend /src/frontend/dist ./wwwroot
-USER root
-RUN mkdir -p /app/data && chown app:app /app/data
 USER app
 ENV ASPNETCORE_HTTP_PORTS=8080
 EXPOSE 8080
-VOLUME /app/data
 ENTRYPOINT ["dotnet", "RMS.Api.dll"]

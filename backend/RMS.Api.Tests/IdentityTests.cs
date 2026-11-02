@@ -34,30 +34,35 @@ public class IdentityTests
     }
 
     [Fact]
-    public void EmailSheet_ReadsTheEmailColumn()
+    public void EmailSheet_ReadsTheEmailAndTest()
     {
         var parsed = InviteSheet.Parse(new IReadOnlyList<string>[]
         {
-            new[] { "name", "email" },
-            new[] { "Aisha", "Aisha.Nakato@rms.local" },
-            new[] { "Blank", "" },
-            new[] { "Bad", "not-an-email" },
-            new[] { "Again", "aisha.nakato@rms.local" }
+            new[] { "name", "email", "test" },
+            new[] { "Aisha", "Aisha.Nakato@rms.local", "Literacy" },
+            new[] { "Blank", "", "Literacy" },
+            new[] { "Bad", "not-an-email", "Literacy" },
+            new[] { "Missing", "leila.nansubuga@rms.local", "" },
+            new[] { "Again", "aisha.nakato@rms.local", "Literacy" },
+            new[] { "Second", "aisha.nakato@rms.local", "Numeracy" }
         });
-        Assert.Equal(["aisha.nakato@rms.local"], parsed.Emails);
-        Assert.Equal(["not-an-email"], parsed.Invalid);
+        Assert.Equal(2, parsed.Rows.Count);
+        Assert.Equal("aisha.nakato@rms.local", parsed.Rows[0].Email);
+        Assert.Equal("Literacy", parsed.Rows[0].Test);
+        Assert.Equal("Numeracy", parsed.Rows[1].Test);
+        Assert.Contains("not-an-email", parsed.Invalid);
+        Assert.Contains("leila.nansubuga@rms.local has no test", parsed.Invalid);
     }
 
     [Fact]
-    public void EmailSheet_UsesTheFirstColumnWhenThereIsNoHeader()
+    public void EmailSheet_RequiresATestColumn()
     {
-        var parsed = InviteSheet.Parse(new IReadOnlyList<string>[]
+        var error = Assert.Throws<InvalidDataException>(() => InviteSheet.Parse(new IReadOnlyList<string>[]
         {
             new[] { "leila.nansubuga@rms.local" },
             new[] { "samuel.kato@rms.local" }
-        });
-        Assert.Equal(2, parsed.Emails.Count);
-        Assert.Empty(parsed.Invalid);
+        }));
+        Assert.Contains("test column", error.Message);
     }
 
     private static JoinWrite Sample() => new(

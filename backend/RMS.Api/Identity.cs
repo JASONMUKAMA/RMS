@@ -5,8 +5,8 @@ using System.Text.RegularExpressions;
 using ClosedXML.Excel;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 
 namespace RMS.Api;
 
@@ -34,7 +34,7 @@ public static class AccountRoles
 
 public readonly record struct JoinReady(string Email, string Given, string Family, string Phone, string Nin, string Address, string Birth);
 
-public sealed record JoinWrite(string Email, string GivenName, string FamilyName, string Phone, string Nin, string Address, string DateOfBirth, string Password);
+public sealed record JoinWrite(string Email, string GivenName, string FamilyName, string Phone, string Nin, string Address, string DateOfBirth, string Password, int? VillageId = null);
 
 public static class ProfileRules
 {
@@ -114,7 +114,8 @@ public static class ProfileRules
     }
 }
 
-public sealed record InviteParse(IReadOnlyList<string> Emails, IReadOnlyList<string> Invalid);
+public sealed record InviteRow(string Email, string Test);
+public sealed record InviteParse(IReadOnlyList<InviteRow> Rows, IReadOnlyList<string> Invalid);
 
 public static class InviteSheet
 {
@@ -124,7 +125,7 @@ public static class InviteSheet
         {
             ".csv" => ReadCsv(stream),
             ".xlsx" => ReadExcel(stream),
-            _ => throw new InvalidDataException("Use an .xlsx or .csv sheet with an email column.")
+            _ => throw new InvalidDataException("Use an .xlsx or .csv sheet with an email column and a test column.")
         };
         return Parse(rows);
     }
@@ -135,31 +136,35 @@ public static class InviteSheet
             throw new InvalidDataException("The sheet is empty.");
 
         var header = rows[0].Select(cell => cell.Trim().ToLowerInvariant()).ToList();
-        var column = header.FindIndex(cell => cell is "email" or "e-mail" or "email address");
-        var start = 0;
-        if (column >= 0)
-            start = 1;
-        else
-            column = 0;
+        var emailColumn = header.FindIndex(cell => cell is "email" or "e-mail" or "email address");
+        var testColumn = header.FindIndex(cell => cell is "test" or "paper" or "exam" or "assessment");
+        if (emailColumn < 0 || testColumn < 0)
+            throw new InvalidDataException("The sheet needs an email column and a test column. The test is the paper title.");
 
-        var emails = new List<string>();
+        var parsed = new List<InviteRow>();
         var invalid = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        for (var i = start; i < rows.Count; i++)
+        for (var i = 1; i < rows.Count; i++)
         {
-            var raw = column < rows[i].Count ? rows[i][column].Trim() : "";
-            if (raw.Length == 0)
+            var rawEmail = emailColumn < rows[i].Count ? rows[i][emailColumn].Trim() : "";
+            var test = testColumn < rows[i].Count ? rows[i][testColumn].Trim() : "";
+            if (rawEmail.Length == 0 && test.Length == 0)
                 continue;
-            var email = raw.ToLowerInvariant();
+            var email = rawEmail.ToLowerInvariant();
             if (!ProfileRules.IsEmail(email))
             {
-                invalid.Add(raw);
+                invalid.Add(rawEmail.Length == 0 ? $"Row {i + 1} has no email" : rawEmail);
                 continue;
             }
-            if (seen.Add(email))
-                emails.Add(email);
+            if (test.Length == 0)
+            {
+                invalid.Add($"{email} has no test");
+                continue;
+            }
+            if (seen.Add($"{email}\n{test.ToLowerInvariant()}"))
+                parsed.Add(new InviteRow(email, test));
         }
-        return new InviteParse(emails, invalid);
+        return new InviteParse(parsed, invalid);
     }
 
     private static List<List<string>> ReadExcel(Stream stream)
@@ -178,7 +183,7 @@ public static class InviteSheet
         }
         catch (Exception)
         {
-            throw new InvalidDataException("That Excel file could not be read. Use a .xlsx sheet with an email column.");
+            throw new InvalidDataException("That Excel file could not be read. Use a .xlsx sheet with an email column and a test column.");
         }
     }
 
@@ -255,39 +260,37 @@ public static class Mailbox
         {
             id = await Insert(db, email, subject, body, kind, sittingId, "pending", "");
         }
-        catch (SqliteException ex) when (ex.SqliteErrorCode == 19)
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
         {
             return new MailReceipt("held", "Already recorded.");
         }
         var (status, detail) = await Deliver(email, subject, body);
-        await using var update = Open(db).CreateCommand();
-        update.CommandText = "UPDATE OutboundMail SET Status = $status, Detail = $detail WHERE Id = $id";
-        update.Parameters.Add(new SqliteParameter("$status", status));
-        update.Parameters.Add(new SqliteParameter("$detail", detail));
-        update.Parameters.Add(new SqliteParameter("$id", id));
+        var connection = await Sql.Open(db);
+        await using var update = Sql.Prepare(connection, "UPDATE \"OutboundMail\" SET \"Status\" = $status, \"Detail\" = $detail WHERE \"Id\" = $id");
+        update.Parameters.Add(Sql.Param("$status", status));
+        update.Parameters.Add(Sql.Param("$detail", detail));
+        update.Parameters.Add(Sql.Param("$id", id));
         await update.ExecuteNonQueryAsync();
         return new MailReceipt(status, detail);
     }
 
     private static async Task<long> Insert(AppDb db, string email, string subject, string body, string kind, int? sittingId, string status, string detail)
     {
-        await using var command = Open(db).CreateCommand();
-        command.CommandText = """
-            INSERT INTO OutboundMail (ToEmail, Subject, Body, Kind, SittingId, Status, Detail, CreatedAt)
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, """
+            INSERT INTO "OutboundMail" ("ToEmail", "Subject", "Body", "Kind", "SittingId", "Status", "Detail", "CreatedAt")
             VALUES ($to, $subject, $body, $kind, $sitting, $status, $detail, $at)
-            """;
-        command.Parameters.Add(new SqliteParameter("$to", email));
-        command.Parameters.Add(new SqliteParameter("$subject", subject));
-        command.Parameters.Add(new SqliteParameter("$body", body));
-        command.Parameters.Add(new SqliteParameter("$kind", kind));
-        command.Parameters.Add(new SqliteParameter("$sitting", (object?)sittingId ?? DBNull.Value));
-        command.Parameters.Add(new SqliteParameter("$status", status));
-        command.Parameters.Add(new SqliteParameter("$detail", detail));
-        command.Parameters.Add(new SqliteParameter("$at", DateTimeOffset.UtcNow.ToString("O")));
-        await command.ExecuteNonQueryAsync();
-        await using var id = Open(db).CreateCommand();
-        id.CommandText = "SELECT last_insert_rowid()";
-        return Convert.ToInt64(await id.ExecuteScalarAsync());
+            RETURNING "Id"
+            """);
+        command.Parameters.Add(Sql.Param("$to", email));
+        command.Parameters.Add(Sql.Param("$subject", subject));
+        command.Parameters.Add(Sql.Param("$body", body));
+        command.Parameters.Add(Sql.Param("$kind", kind));
+        command.Parameters.Add(Sql.Param("$sitting", (object?)sittingId ?? DBNull.Value));
+        command.Parameters.Add(Sql.Param("$status", status));
+        command.Parameters.Add(Sql.Param("$detail", detail));
+        command.Parameters.Add(Sql.Param("$at", DateTimeOffset.UtcNow.ToString("O")));
+        return Convert.ToInt64(await command.ExecuteScalarAsync());
     }
 
     private static async Task<(string Status, string Detail)> Deliver(string email, string subject, string body)
@@ -320,85 +323,105 @@ public static class Mailbox
         }
     }
 
-    private static SqliteConnection Open(AppDb db)
-    {
-        var connection = (SqliteConnection)db.Database.GetDbConnection();
-        if (connection.State != System.Data.ConnectionState.Open)
-            connection.Open();
-        return connection;
-    }
 }
 
 public static class IdentitySchema
 {
     public static async Task Ensure(AppDb db)
     {
-        var connection = (SqliteConnection)db.Database.GetDbConnection();
-        if (connection.State != System.Data.ConnectionState.Open)
-            await connection.OpenAsync();
+        var connection = await Sql.Open(db);
         foreach (var (column, definition) in new (string Column, string Definition)[]
         {
-            ("GivenName", "TEXT NOT NULL DEFAULT ''"),
-            ("FamilyName", "TEXT NOT NULL DEFAULT ''"),
-            ("Phone", "TEXT NOT NULL DEFAULT ''"),
-            ("Nin", "TEXT NOT NULL DEFAULT ''"),
-            ("Address", "TEXT NOT NULL DEFAULT ''"),
-            ("DateOfBirth", "TEXT NOT NULL DEFAULT ''"),
-            ("Active", "INTEGER NOT NULL DEFAULT 1"),
-            ("ProfileComplete", "INTEGER NOT NULL DEFAULT 1")
+            ("GivenName", "text NOT NULL DEFAULT ''"),
+            ("FamilyName", "text NOT NULL DEFAULT ''"),
+            ("Phone", "text NOT NULL DEFAULT ''"),
+            ("Nin", "text NOT NULL DEFAULT ''"),
+            ("Address", "text NOT NULL DEFAULT ''"),
+            ("DateOfBirth", "text NOT NULL DEFAULT ''"),
+            ("Active", "boolean NOT NULL DEFAULT true"),
+            ("ProfileComplete", "boolean NOT NULL DEFAULT true")
         })
             await AddColumn(connection, column, definition);
 
         await using var command = connection.CreateCommand();
         command.CommandText = """
-            CREATE TABLE IF NOT EXISTS ExamDuties (
-                Id INTEGER NOT NULL CONSTRAINT PK_ExamDuties PRIMARY KEY AUTOINCREMENT,
-                AssessmentId INTEGER NOT NULL,
-                TeacherId INTEGER NOT NULL
+            CREATE TABLE IF NOT EXISTS "ExamDuties" (
+                "Id" integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                "AssessmentId" integer NOT NULL,
+                "TeacherId" integer NOT NULL
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS IX_ExamDuties_Pair ON ExamDuties (AssessmentId, TeacherId);
-            CREATE TABLE IF NOT EXISTS Invites (
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                Email TEXT NOT NULL,
-                CreatedAt TEXT NOT NULL,
-                UsedAt TEXT
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_ExamDuties_Pair" ON "ExamDuties" ("AssessmentId", "TeacherId");
+            CREATE TABLE IF NOT EXISTS "Invites" (
+                "Id" integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                "Email" text NOT NULL,
+                "CreatedAt" text NOT NULL,
+                "UsedAt" text
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS IX_Invites_Email ON Invites (Email);
-            CREATE TABLE IF NOT EXISTS Addresses (
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                Name TEXT NOT NULL
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_Invites_Email" ON "Invites" ("Email");
+            ALTER TABLE "Invites" ADD COLUMN IF NOT EXISTS "AssessmentId" integer;
+            DROP INDEX IF EXISTS "IX_Invites_Email";
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_Invites_Email_Test" ON "Invites" ("Email", "AssessmentId");
+            CREATE TABLE IF NOT EXISTS "Addresses" (
+                "Id" integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                "Name" text NOT NULL
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS IX_Addresses_Name ON Addresses (Name);
-            CREATE TABLE IF NOT EXISTS OutboundMail (
-                Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ToEmail TEXT NOT NULL,
-                Subject TEXT NOT NULL,
-                Body TEXT NOT NULL,
-                Kind TEXT NOT NULL,
-                SittingId INTEGER,
-                Status TEXT NOT NULL,
-                Detail TEXT NOT NULL,
-                CreatedAt TEXT NOT NULL
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_Addresses_Name" ON "Addresses" ("Name");
+            CREATE TABLE IF NOT EXISTS "Districts" (
+                "Id" integer PRIMARY KEY,
+                "Name" text NOT NULL
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS IX_OutboundMail_Result ON OutboundMail (Kind, SittingId) WHERE SittingId IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS "Counties" (
+                "Id" integer PRIMARY KEY,
+                "Name" text NOT NULL,
+                "DistrictId" integer NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS "IX_Counties_District" ON "Counties" ("DistrictId");
+            CREATE TABLE IF NOT EXISTS "Subcounties" (
+                "Id" integer PRIMARY KEY,
+                "Name" text NOT NULL,
+                "CountyId" integer NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS "IX_Subcounties_County" ON "Subcounties" ("CountyId");
+            CREATE TABLE IF NOT EXISTS "Parishes" (
+                "Id" integer PRIMARY KEY,
+                "Name" text NOT NULL,
+                "SubcountyId" integer NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS "IX_Parishes_Subcounty" ON "Parishes" ("SubcountyId");
+            CREATE TABLE IF NOT EXISTS "Villages" (
+                "Id" integer PRIMARY KEY,
+                "Name" text NOT NULL,
+                "ParishId" integer NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS "IX_Villages_Parish" ON "Villages" ("ParishId");
+            CREATE TABLE IF NOT EXISTS "OutboundMail" (
+                "Id" integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                "ToEmail" text NOT NULL,
+                "Subject" text NOT NULL,
+                "Body" text NOT NULL,
+                "Kind" text NOT NULL,
+                "SittingId" integer,
+                "Status" text NOT NULL,
+                "Detail" text NOT NULL,
+                "CreatedAt" text NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_OutboundMail_Result" ON "OutboundMail" ("Kind", "SittingId") WHERE "SittingId" IS NOT NULL;
             """;
         await command.ExecuteNonQueryAsync();
     }
 
-    private static async Task AddColumn(SqliteConnection connection, string column, string definition)
+    private static async Task AddColumn(NpgsqlConnection connection, string column, string definition)
     {
-        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        await using (var read = connection.CreateCommand())
-        {
-            read.CommandText = "PRAGMA table_info(Users)";
-            await using var reader = await read.ExecuteReaderAsync();
-            while (await reader.ReadAsync())
-                names.Add(reader.GetString(1));
-        }
-        if (names.Contains(column))
+        await using var read = connection.CreateCommand();
+        read.CommandText = """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'Users' AND column_name = @column
+            """;
+        read.Parameters.Add(new NpgsqlParameter("column", column));
+        if (await read.ExecuteScalarAsync() is not null)
             return;
         await using var alter = connection.CreateCommand();
-        alter.CommandText = $"ALTER TABLE Users ADD COLUMN {column} {definition}";
+        alter.CommandText = $"ALTER TABLE \"Users\" ADD COLUMN \"{column}\" {definition}";
         await alter.ExecuteNonQueryAsync();
     }
 }
@@ -431,6 +454,7 @@ public static class PeopleEndpoints
     public static void Map(WebApplication app)
     {
         app.MapGet("/api/join/addresses", async (AppDb db) => Results.Ok(await AddressNames(db)));
+        Places.Map(app);
 
         app.MapPost("/api/join/check", async (EmailCheck body, AppDb db) =>
         {
@@ -447,8 +471,11 @@ public static class PeopleEndpoints
 
         app.MapPost("/api/join", async (JoinWrite body, AppDb db, HttpContext http) =>
         {
-            var addresses = await AddressNames(db);
-            if (ProfileRules.Check(body, addresses, out var ready) is string error)
+            var place = body.VillageId is int villageId ? await Places.Path(db, villageId) : null;
+            if (body.VillageId is not null && place is null)
+                return Results.BadRequest(new { error = "Choose a village from the list." });
+            var addresses = place is not null ? new List<string> { place } : await AddressNames(db);
+            if (ProfileRules.Check(place is null ? body : body with { Address = place }, addresses, out var ready) is string error)
                 return Results.BadRequest(new { error });
             var invite = await FindInvite(db, ready.Email);
             if (invite is null)
@@ -488,14 +515,14 @@ public static class PeopleEndpoints
             var table = ReadTable(request, 0);
             var order = table.Column switch
             {
-                1 => "Email",
-                2 => "Role",
-                3 => "Active",
-                _ => "FullName"
+                1 => "\"Email\"",
+                2 => "\"Role\"",
+                3 => "\"Active\"",
+                _ => "\"FullName\""
             };
-            var filter = table.Term.Length > 0 ? "WHERE FullName LIKE $term OR Email LIKE $term OR Role LIKE $term" : "";
-            var rows = await Page(db, "Users", filter, order, table, """
-                SELECT Id, FullName, Email, Role, Active, Phone, Nin, Address, DateOfBirth
+            var filter = table.Term.Length > 0 ? "WHERE \"FullName\" ILIKE $term OR \"Email\" ILIKE $term OR \"Role\" ILIKE $term" : "";
+            var rows = await Page(db, "\"Users\"", filter, order, table, """
+                SELECT "Id", "FullName", "Email", "Role", "Active", "Phone", "Nin", "Address", "DateOfBirth"
                 """);
             return Results.Ok(rows);
         }).RequireAuthorization();
@@ -591,44 +618,56 @@ public static class PeopleEndpoints
             {
                 return Results.BadRequest(new { error = ex.Message });
             }
-            if (parsed.Emails.Count == 0 && parsed.Invalid.Count == 0)
+            if (parsed.Rows.Count == 0 && parsed.Invalid.Count == 0)
                 return Results.BadRequest(new { error = "The sheet has no email rows." });
 
-            var known = (await db.Users.AsNoTracking().Select(item => item.Email).ToListAsync()).ToHashSet(StringComparer.Ordinal);
-            var invited = (await Emails(db, "SELECT Email FROM Invites")).ToHashSet(StringComparer.Ordinal);
+            var papers = await db.Assessments.AsNoTracking().Select(item => new { item.Id, item.Title }).ToListAsync();
+            var byTitle = papers
+                .GroupBy(item => item.Title.Trim(), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.Select(item => item.Id).Distinct().ToList(), StringComparer.OrdinalIgnoreCase);
             var added = 0;
             var already = 0;
+            var invalid = parsed.Invalid.ToList();
             var now = DateTimeOffset.UtcNow.ToString("O");
-            foreach (var email in parsed.Emails)
+            foreach (var row in parsed.Rows)
             {
-                if (!known.Add(email) || !invited.Add(email))
+                if (!byTitle.TryGetValue(row.Test, out var matches) || matches.Count == 0)
                 {
-                    already++;
+                    invalid.Add($"{row.Email} · no paper named {row.Test}");
                     continue;
                 }
-                await using var insert = Open(db).CreateCommand();
-                insert.CommandText = "INSERT INTO Invites (Email, CreatedAt) VALUES ($email, $at)";
-                insert.Parameters.Add(new SqliteParameter("$email", email));
-                insert.Parameters.Add(new SqliteParameter("$at", now));
-                await insert.ExecuteNonQueryAsync();
-                added++;
+                if (matches.Count > 1)
+                {
+                    invalid.Add($"{row.Email} · more than one paper is named {row.Test}");
+                    continue;
+                }
+                if (await AssignInvite(db, row.Email, matches[0], now))
+                    added++;
+                else
+                    already++;
             }
-            return Results.Ok(new { added, already, invalid = parsed.Invalid.Take(8).ToList(), invalidCount = parsed.Invalid.Count });
+            return Results.Ok(new { added, already, invalid = invalid.Take(8).ToList(), invalidCount = invalid.Count });
         }).RequireAuthorization();
 
         app.MapGet("/api/invites", async (ClaimsPrincipal actor, AppDb db, HttpRequest request) =>
         {
             if (!IsSystemAdmin(actor))
                 return Results.Forbid();
-            var table = ReadTable(request, 1);
+            var table = ReadTable(request, 2);
             var order = table.Column switch
             {
-                0 => "Email",
-                2 => "UsedAt",
-                _ => "CreatedAt"
+                0 => "\"Email\"",
+                1 => "\"Test\"",
+                3 => "\"UsedAt\"",
+                _ => "\"CreatedAt\""
             };
-            var filter = table.Term.Length > 0 ? "WHERE Email LIKE $term" : "";
-            return Results.Ok(await Page(db, "Invites", filter, order, table, "SELECT Id, Email, CreatedAt, UsedAt"));
+            var filter = table.Term.Length > 0
+                ? "WHERE \"Email\" ILIKE $term OR COALESCE((SELECT \"Title\" FROM \"Assessments\" WHERE \"Id\" = \"Invites\".\"AssessmentId\"), '') ILIKE $term"
+                : "";
+            return Results.Ok(await Page(db, "\"Invites\"", filter, order, table, """
+                SELECT "Id", "Email", "CreatedAt", "UsedAt",
+                    COALESCE((SELECT "Title" FROM "Assessments" WHERE "Id" = "Invites"."AssessmentId"), '') AS "Test"
+                """));
         }).RequireAuthorization();
 
         app.MapGet("/api/addresses", async (ClaimsPrincipal actor, AppDb db) =>
@@ -636,8 +675,8 @@ public static class PeopleEndpoints
             if (!IsSystemAdmin(actor))
                 return Results.Forbid();
             var rows = new List<object>();
-            await using var command = Open(db).CreateCommand();
-            command.CommandText = "SELECT Id, Name FROM Addresses ORDER BY Name";
+            var connection = await Sql.Open(db);
+            await using var command = Sql.Prepare(connection, "SELECT \"Id\", \"Name\" FROM \"Addresses\" ORDER BY \"Name\"");
             await using var reader = await command.ExecuteReaderAsync();
             while (await reader.ReadAsync())
                 rows.Add(new { id = reader.GetInt32(0), name = reader.GetString(1) });
@@ -659,9 +698,9 @@ public static class PeopleEndpoints
             {
                 if (!existing.Add(name))
                     continue;
-                await using var insert = Open(db).CreateCommand();
-                insert.CommandText = "INSERT INTO Addresses (Name) VALUES ($name)";
-                insert.Parameters.Add(new SqliteParameter("$name", name));
+                var connection = await Sql.Open(db);
+                await using var insert = Sql.Prepare(connection, "INSERT INTO \"Addresses\" (\"Name\") VALUES ($name)");
+                insert.Parameters.Add(Sql.Param("$name", name));
                 await insert.ExecuteNonQueryAsync();
                 added++;
             }
@@ -672,9 +711,9 @@ public static class PeopleEndpoints
         {
             if (!IsSystemAdmin(actor))
                 return Results.Forbid();
-            await using var command = Open(db).CreateCommand();
-            command.CommandText = "DELETE FROM Addresses WHERE Id = $id";
-            command.Parameters.Add(new SqliteParameter("$id", id));
+            var connection = await Sql.Open(db);
+            await using var command = Sql.Prepare(connection, "DELETE FROM \"Addresses\" WHERE \"Id\" = $id");
+            command.Parameters.Add(Sql.Param("$id", id));
             await command.ExecuteNonQueryAsync();
             return Results.NoContent();
         }).RequireAuthorization();
@@ -686,23 +725,25 @@ public static class PeopleEndpoints
             var table = ReadTable(request, 4);
             var order = table.Column switch
             {
-                0 => "ToEmail",
-                1 => "Subject",
-                2 => "Kind",
-                3 => "Status",
-                _ => "CreatedAt"
+                0 => "\"ToEmail\"",
+                1 => "\"Subject\"",
+                2 => "\"Kind\"",
+                3 => "\"Status\"",
+                _ => "\"CreatedAt\""
             };
-            var filter = table.Term.Length > 0 ? "WHERE ToEmail LIKE $term OR Subject LIKE $term OR Kind LIKE $term OR Status LIKE $term" : "";
-            return Results.Ok(await Page(db, "OutboundMail", filter, order, table, "SELECT Id, ToEmail, Subject, Kind, Status, CreatedAt"));
+            var filter = table.Term.Length > 0 ? "WHERE \"ToEmail\" ILIKE $term OR \"Subject\" ILIKE $term OR \"Kind\" ILIKE $term OR \"Status\" ILIKE $term" : "";
+            return Results.Ok(await Page(db, "\"OutboundMail\"", filter, order, table, "SELECT \"Id\", \"ToEmail\", \"Subject\", \"Kind\", \"Status\", \"CreatedAt\""));
         }).RequireAuthorization();
 
         app.MapGet("/api/mail/{id:int}", async (int id, ClaimsPrincipal actor, AppDb db) =>
         {
             if (!IsSystemAdmin(actor))
                 return Results.Forbid();
-            await using var command = Open(db).CreateCommand();
-            command.CommandText = "SELECT ToEmail, Subject, Body, Kind, Status, Detail, CreatedAt FROM OutboundMail WHERE Id = $id";
-            command.Parameters.Add(new SqliteParameter("$id", id));
+            var connection = await Sql.Open(db);
+            await using var command = Sql.Prepare(connection, """
+                SELECT "ToEmail", "Subject", "Body", "Kind", "Status", "Detail", "CreatedAt" FROM "OutboundMail" WHERE "Id" = $id
+                """);
+            command.Parameters.Add(Sql.Param("$id", id));
             await using var reader = await command.ExecuteReaderAsync();
             if (!await reader.ReadAsync())
                 return Results.NotFound();
@@ -776,24 +817,68 @@ public static class PeopleEndpoints
         !await db.Users.AnyAsync(item => item.Role == AccountRoles.SystemAdmin && item.Active && item.Id != id);
 
     private static async Task<List<string>> AddressNames(AppDb db) =>
-        await Emails(db, "SELECT Name FROM Addresses ORDER BY Name");
+        await Emails(db, "SELECT \"Name\" FROM \"Addresses\" ORDER BY \"Name\"");
 
     private static async Task<List<string>> Emails(AppDb db, string sql)
     {
         var rows = new List<string>();
-        await using var command = Open(db).CreateCommand();
-        command.CommandText = sql;
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, sql);
         await using var reader = await command.ExecuteReaderAsync();
         while (await reader.ReadAsync())
             rows.Add(reader.GetString(0));
         return rows;
     }
 
+    private static async Task<bool> AssignInvite(AppDb db, string email, int assessmentId, string now)
+    {
+        var connection = await Sql.Open(db);
+        await using var existing = Sql.Prepare(connection, "SELECT \"Id\", \"AssessmentId\" FROM \"Invites\" WHERE \"Email\" = $email");
+        existing.Parameters.Add(Sql.Param("$email", email));
+        var blank = 0;
+        await using (var reader = await existing.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                if (!reader.IsDBNull(1) && reader.GetInt32(1) == assessmentId)
+                    return false;
+                if (reader.IsDBNull(1) && blank == 0)
+                    blank = reader.GetInt32(0);
+            }
+        }
+        if (blank > 0)
+        {
+            await using var update = Sql.Prepare(connection, "UPDATE \"Invites\" SET \"AssessmentId\" = $paper WHERE \"Id\" = $id");
+            update.Parameters.Add(Sql.Param("$paper", assessmentId));
+            update.Parameters.Add(Sql.Param("$id", blank));
+            await update.ExecuteNonQueryAsync();
+            return true;
+        }
+        await using var insert = Sql.Prepare(connection, "INSERT INTO \"Invites\" (\"Email\", \"CreatedAt\", \"AssessmentId\") VALUES ($email, $at, $paper)");
+        insert.Parameters.Add(Sql.Param("$email", email));
+        insert.Parameters.Add(Sql.Param("$at", now));
+        insert.Parameters.Add(Sql.Param("$paper", assessmentId));
+        await insert.ExecuteNonQueryAsync();
+        return true;
+    }
+
+    public static async Task<HashSet<int>> TestsFor(AppDb db, string email)
+    {
+        var ids = new HashSet<int>();
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, "SELECT \"AssessmentId\" FROM \"Invites\" WHERE \"Email\" = $email AND \"AssessmentId\" IS NOT NULL");
+        command.Parameters.Add(Sql.Param("$email", email));
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+            ids.Add(reader.GetInt32(0));
+        return ids;
+    }
+
     private static async Task<(bool Found, bool Used)?> FindInvite(AppDb db, string email)
     {
-        await using var command = Open(db).CreateCommand();
-        command.CommandText = "SELECT UsedAt FROM Invites WHERE Email = $email";
-        command.Parameters.Add(new SqliteParameter("$email", email));
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, "SELECT \"UsedAt\" FROM \"Invites\" WHERE \"Email\" = $email");
+        command.Parameters.Add(Sql.Param("$email", email));
         await using var reader = await command.ExecuteReaderAsync();
         if (!await reader.ReadAsync())
             return null;
@@ -802,10 +887,10 @@ public static class PeopleEndpoints
 
     private static async Task MarkInviteUsed(AppDb db, string email)
     {
-        await using var command = Open(db).CreateCommand();
-        command.CommandText = "UPDATE Invites SET UsedAt = $at WHERE Email = $email";
-        command.Parameters.Add(new SqliteParameter("$at", DateTimeOffset.UtcNow.ToString("O")));
-        command.Parameters.Add(new SqliteParameter("$email", email));
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, "UPDATE \"Invites\" SET \"UsedAt\" = $at WHERE \"Email\" = $email");
+        command.Parameters.Add(Sql.Param("$at", DateTimeOffset.UtcNow.ToString("O")));
+        command.Parameters.Add(Sql.Param("$email", email));
         await command.ExecuteNonQueryAsync();
     }
 
@@ -825,22 +910,20 @@ public static class PeopleEndpoints
     private static async Task<object> Page(AppDb db, string table, string filter, string order, TableQuery query, string select)
     {
         var direction = query.Descending ? "DESC" : "ASC";
-        await using var total = Open(db).CreateCommand();
-        total.CommandText = $"SELECT COUNT(*) FROM {table}";
+        var connection = await Sql.Open(db);
+        await using var total = Sql.Prepare(connection, $"SELECT COUNT(*) FROM {table}");
         var recordsTotal = Convert.ToInt32(await total.ExecuteScalarAsync());
 
-        await using var filtered = Open(db).CreateCommand();
-        filtered.CommandText = $"SELECT COUNT(*) FROM {table} {filter}";
+        await using var filtered = Sql.Prepare(connection, $"SELECT COUNT(*) FROM {table} {filter}");
         if (query.Term.Length > 0)
-            filtered.Parameters.Add(new SqliteParameter("$term", $"%{query.Term}%"));
+            filtered.Parameters.Add(Sql.Param("$term", $"%{query.Term}%"));
         var recordsFiltered = Convert.ToInt32(await filtered.ExecuteScalarAsync());
 
-        await using var page = Open(db).CreateCommand();
-        page.CommandText = $"{select} FROM {table} {filter} ORDER BY {order} {direction}, Id DESC LIMIT $length OFFSET $start";
-        page.Parameters.Add(new SqliteParameter("$length", query.Length));
-        page.Parameters.Add(new SqliteParameter("$start", query.Start));
+        await using var page = Sql.Prepare(connection, $"{select} FROM {table} {filter} ORDER BY {order} {direction}, \"Id\" DESC LIMIT $length OFFSET $start");
+        page.Parameters.Add(Sql.Param("$length", query.Length));
+        page.Parameters.Add(Sql.Param("$start", query.Start));
         if (query.Term.Length > 0)
-            page.Parameters.Add(new SqliteParameter("$term", $"%{query.Term}%"));
+            page.Parameters.Add(Sql.Param("$term", $"%{query.Term}%"));
         var data = new List<Dictionary<string, object?>>();
         await using var reader = await page.ExecuteReaderAsync();
         while (await reader.ReadAsync())
@@ -855,13 +938,5 @@ public static class PeopleEndpoints
             data.Add(row);
         }
         return new { draw = query.Draw, recordsTotal, recordsFiltered, data };
-    }
-
-    private static SqliteConnection Open(AppDb db)
-    {
-        var connection = (SqliteConnection)db.Database.GetDbConnection();
-        if (connection.State != System.Data.ConnectionState.Open)
-            connection.Open();
-        return connection;
     }
 }

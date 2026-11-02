@@ -1,5 +1,4 @@
 using Microsoft.AspNetCore.SignalR;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 
 namespace RMS.Api;
@@ -16,16 +15,16 @@ public static class ExamLog
     {
         if (warning && debounce && await RecentWarning(db, sittingId, kind))
             return;
-        await using var command = Connection(db).CreateCommand();
-        command.CommandText = """
-            INSERT INTO ExamEvents (SittingId, Kind, Detail, Warning, At)
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, """
+            INSERT INTO "ExamEvents" ("SittingId", "Kind", "Detail", "Warning", "At")
             VALUES ($sitting, $kind, $detail, $warning, $at)
-            """;
-        command.Parameters.Add(new SqliteParameter("$sitting", sittingId));
-        command.Parameters.Add(new SqliteParameter("$kind", kind));
-        command.Parameters.Add(new SqliteParameter("$detail", detail));
-        command.Parameters.Add(new SqliteParameter("$warning", warning ? 1 : 0));
-        command.Parameters.Add(new SqliteParameter("$at", DateTimeOffset.UtcNow.ToString("O")));
+            """);
+        command.Parameters.Add(Sql.Param("$sitting", sittingId));
+        command.Parameters.Add(Sql.Param("$kind", kind));
+        command.Parameters.Add(Sql.Param("$detail", detail));
+        command.Parameters.Add(Sql.Param("$warning", warning ? 1 : 0));
+        command.Parameters.Add(Sql.Param("$at", DateTimeOffset.UtcNow.ToString("O")));
         await command.ExecuteNonQueryAsync();
     }
 
@@ -35,14 +34,14 @@ public static class ExamLog
         var warnings = await WarningCount(db, sittingId);
         if (!NeedsCheck(warnings))
             return null;
-        await using var open = Connection(db).CreateCommand();
-        open.CommandText = """
-            INSERT INTO ExamChecks (SittingId, OpenedAt)
+        var connection = await Sql.Open(db);
+        await using var open = Sql.Prepare(connection, """
+            INSERT INTO "ExamChecks" ("SittingId", "OpenedAt")
             VALUES ($sitting, $at)
-            ON CONFLICT(SittingId) DO NOTHING
-            """;
-        open.Parameters.Add(new SqliteParameter("$sitting", sittingId));
-        open.Parameters.Add(new SqliteParameter("$at", DateTimeOffset.UtcNow.ToString("O")));
+            ON CONFLICT ("SittingId") DO NOTHING
+            """);
+        open.Parameters.Add(Sql.Param("$sitting", sittingId));
+        open.Parameters.Add(Sql.Param("$at", DateTimeOffset.UtcNow.ToString("O")));
         if (await open.ExecuteNonQueryAsync() != 1)
             return null;
 
@@ -87,42 +86,36 @@ public static class ExamLog
     public static async Task Seal(AppDb db, int sittingId)
     {
         var warnings = await WarningCount(db, sittingId);
-        await using var command = Connection(db).CreateCommand();
-        command.CommandText = """
-            INSERT INTO ExamSummaries (SittingId, ClosedAt, Warnings)
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, """
+            INSERT INTO "ExamSummaries" ("SittingId", "ClosedAt", "Warnings")
             VALUES ($sitting, $at, $warnings)
-            ON CONFLICT(SittingId) DO UPDATE SET Warnings = excluded.Warnings
-            """;
-        command.Parameters.Add(new SqliteParameter("$sitting", sittingId));
-        command.Parameters.Add(new SqliteParameter("$at", DateTimeOffset.UtcNow.ToString("O")));
-        command.Parameters.Add(new SqliteParameter("$warnings", warnings));
+            ON CONFLICT ("SittingId") DO UPDATE SET "Warnings" = excluded."Warnings"
+            """);
+        command.Parameters.Add(Sql.Param("$sitting", sittingId));
+        command.Parameters.Add(Sql.Param("$at", DateTimeOffset.UtcNow.ToString("O")));
+        command.Parameters.Add(Sql.Param("$warnings", warnings));
         await command.ExecuteNonQueryAsync();
         await Mailbox.SendResult(db, sittingId);
     }
 
     public static async Task<int> WarningCount(AppDb db, int sittingId)
     {
-        await using var command = Connection(db).CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM ExamEvents WHERE SittingId = $sitting AND Warning = 1";
-        command.Parameters.Add(new SqliteParameter("$sitting", sittingId));
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, "SELECT COUNT(*) FROM \"ExamEvents\" WHERE \"SittingId\" = $sitting AND \"Warning\" = 1");
+        command.Parameters.Add(Sql.Param("$sitting", sittingId));
         return Convert.ToInt32(await command.ExecuteScalarAsync());
     }
 
     private static async Task<bool> RecentWarning(AppDb db, int sittingId, string kind)
     {
-        await using var command = Connection(db).CreateCommand();
-        command.CommandText = "SELECT At FROM ExamEvents WHERE SittingId = $sitting AND Kind = $kind AND Warning = 1 ORDER BY Id DESC LIMIT 1";
-        command.Parameters.Add(new SqliteParameter("$sitting", sittingId));
-        command.Parameters.Add(new SqliteParameter("$kind", kind));
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, """
+            SELECT "At" FROM "ExamEvents" WHERE "SittingId" = $sitting AND "Kind" = $kind AND "Warning" = 1 ORDER BY "Id" DESC LIMIT 1
+            """);
+        command.Parameters.Add(Sql.Param("$sitting", sittingId));
+        command.Parameters.Add(Sql.Param("$kind", kind));
         var raw = await command.ExecuteScalarAsync() as string;
         return DateTimeOffset.TryParse(raw, out var at) && DateTimeOffset.UtcNow - at < TimeSpan.FromSeconds(12);
-    }
-
-    private static SqliteConnection Connection(AppDb db)
-    {
-        var connection = (SqliteConnection)db.Database.GetDbConnection();
-        if (connection.State != System.Data.ConnectionState.Open)
-            connection.Open();
-        return connection;
     }
 }

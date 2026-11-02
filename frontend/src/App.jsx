@@ -1150,7 +1150,7 @@ function Student({ me, onStart, onLogout }) {
           <ExamCard key={paper.id} paper={paper} onOpen={() => start(paper.id)} />
         ))}
       </div>
-      {shown.length === 0 && <p>{page === "todo" ? "Nothing waiting. You are clear." : "No finished paper yet."}</p>}
+      {shown.length === 0 && <p>{page === "todo" ? "No exam is assigned to you yet." : "No finished paper yet."}</p>}
     </>
   );
 

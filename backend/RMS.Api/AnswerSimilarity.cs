@@ -1,6 +1,5 @@
 using System.Threading.Channels;
 using Microsoft.AspNetCore.SignalR;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -33,19 +32,21 @@ public sealed class AnswerSimilarity(IServiceScopeFactory scopes, IHostEnvironme
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        try
-        {
-            Load();
-            logger.LogInformation("BGE-M3 is loaded ({ModelId}).", ModelId);
-        }
-        catch (Exception ex)
-        {
-            _failed = true;
-            logger.LogError(ex, "BGE-M3 did not start. Short-answer similarity stays quiet.");
-        }
-
         await foreach (var answerId in _queue.Reader.ReadAllAsync(stoppingToken))
         {
+            if (!Ready && !_failed)
+            {
+                try
+                {
+                    Load();
+                    logger.LogInformation("BGE-M3 is loaded ({ModelId}).", ModelId);
+                }
+                catch (Exception ex)
+                {
+                    _failed = true;
+                    logger.LogError(ex, "BGE-M3 did not start. Short-answer similarity stays quiet.");
+                }
+            }
             if (!Ready)
                 continue;
             try
@@ -192,34 +193,31 @@ public sealed class AnswerSimilarity(IServiceScopeFactory scopes, IHostEnvironme
     {
         var bytes = new byte[vector.Length * sizeof(float)];
         Buffer.BlockCopy(vector, 0, bytes, 0, bytes.Length);
-        var connection = Connection(db);
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO AnswerVectors (AnswerId, ModelId, Vector)
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, """
+            INSERT INTO "AnswerVectors" ("AnswerId", "ModelId", "Vector")
             VALUES ($id, $model, $vector)
-            ON CONFLICT(AnswerId) DO UPDATE SET ModelId = excluded.ModelId, Vector = excluded.Vector
-            """;
-        command.Parameters.Add(new SqliteParameter("$id", answerId));
-        command.Parameters.Add(new SqliteParameter("$model", ModelId));
-        command.Parameters.Add(new SqliteParameter("$vector", bytes));
+            ON CONFLICT ("AnswerId") DO UPDATE SET "ModelId" = excluded."ModelId", "Vector" = excluded."Vector"
+            """);
+        command.Parameters.Add(Sql.Param("$id", answerId));
+        command.Parameters.Add(Sql.Param("$model", ModelId));
+        command.Parameters.Add(Sql.Param("$vector", bytes));
         await command.ExecuteNonQueryAsync();
     }
 
     private static async Task DeleteVector(AppDb db, int answerId)
     {
-        var connection = Connection(db);
-        await using var command = connection.CreateCommand();
-        command.CommandText = "DELETE FROM AnswerVectors WHERE AnswerId = $id";
-        command.Parameters.Add(new SqliteParameter("$id", answerId));
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, "DELETE FROM \"AnswerVectors\" WHERE \"AnswerId\" = $id");
+        command.Parameters.Add(Sql.Param("$id", answerId));
         await command.ExecuteNonQueryAsync();
     }
 
     private static async Task<float[]?> LoadVector(AppDb db, int answerId)
     {
-        var connection = Connection(db);
-        await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT Vector FROM AnswerVectors WHERE AnswerId = $id";
-        command.Parameters.Add(new SqliteParameter("$id", answerId));
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, "SELECT \"Vector\" FROM \"AnswerVectors\" WHERE \"AnswerId\" = $id");
+        command.Parameters.Add(Sql.Param("$id", answerId));
         var raw = await command.ExecuteScalarAsync();
         if (raw is not byte[] bytes || bytes.Length == 0 || bytes.Length % sizeof(float) != 0)
             return null;
@@ -232,18 +230,17 @@ public sealed class AnswerSimilarity(IServiceScopeFactory scopes, IHostEnvironme
     {
         var first = Math.Min(leftId, rightId);
         var second = Math.Max(leftId, rightId);
-        var connection = Connection(db);
-        await using var command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO SimilarAnswers (LeftAnswerId, RightAnswerId, Cosine, ModelId, At)
+        var connection = await Sql.Open(db);
+        await using var command = Sql.Prepare(connection, """
+            INSERT INTO "SimilarAnswers" ("LeftAnswerId", "RightAnswerId", "Cosine", "ModelId", "At")
             VALUES ($left, $right, $cosine, $model, $at)
-            ON CONFLICT(LeftAnswerId, RightAnswerId) DO NOTHING
-            """;
-        command.Parameters.Add(new SqliteParameter("$left", first));
-        command.Parameters.Add(new SqliteParameter("$right", second));
-        command.Parameters.Add(new SqliteParameter("$cosine", cosine));
-        command.Parameters.Add(new SqliteParameter("$model", ModelId));
-        command.Parameters.Add(new SqliteParameter("$at", DateTimeOffset.UtcNow.ToString("O")));
+            ON CONFLICT ("LeftAnswerId", "RightAnswerId") DO NOTHING
+            """);
+        command.Parameters.Add(Sql.Param("$left", first));
+        command.Parameters.Add(Sql.Param("$right", second));
+        command.Parameters.Add(Sql.Param("$cosine", cosine));
+        command.Parameters.Add(Sql.Param("$model", ModelId));
+        command.Parameters.Add(Sql.Param("$at", DateTimeOffset.UtcNow.ToString("O")));
         return await command.ExecuteNonQueryAsync() == 1;
     }
 
@@ -266,11 +263,4 @@ public sealed class AnswerSimilarity(IServiceScopeFactory scopes, IHostEnvironme
         }
     }
 
-    private static SqliteConnection Connection(AppDb db)
-    {
-        var connection = (SqliteConnection)db.Database.GetDbConnection();
-        if (connection.State != System.Data.ConnectionState.Open)
-            connection.Open();
-        return connection;
-    }
 }

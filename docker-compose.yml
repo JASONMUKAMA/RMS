@@ -1,13 +1,30 @@
 services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: rms
+      POSTGRES_PASSWORD: rms
+      POSTGRES_DB: rms
+    volumes:
+      - rms-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rms -d rms"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   rms:
     build: .
     ports:
       - "8080:8080"
     environment:
       ASPNETCORE_ENVIRONMENT: Production
-    volumes:
-      - rms-data:/app/data
+      RMS_DB: Host=postgres;Port=5432;Database=rms;Username=rms;Password=rms;GSS Encryption Mode=Disable
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
-  rms-data:
+  rms-pg:
