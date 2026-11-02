@@ -18,8 +18,15 @@ services:
     build: .
     ports:
       - "8080:8080"
+      - "8443:8443"
+    volumes:
+      - ./certs/rms.pfx:/certs/rms.pfx:ro
     environment:
       ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_HTTP_PORTS: "8080"
+      ASPNETCORE_HTTPS_PORTS: "8443"
+      ASPNETCORE_Kestrel__Certificates__Default__Path: /certs/rms.pfx
+      ASPNETCORE_Kestrel__Certificates__Default__Password: rms
       RMS_DB: Host=postgres;Port=5432;Database=rms;Username=rms;Password=rms;GSS Encryption Mode=Disable
     depends_on:
       postgres:

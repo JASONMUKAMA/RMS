@@ -5,7 +5,7 @@ import "datatables.net-dt/css/dataTables.dataTables.css";
 import { api } from "./api";
 import ExamRoom from "./ExamRoom";
 import { openViewer } from "./liveDesk";
-import { CheckBanners, JoinWizard, SystemAdmin, roleLabel, useExamChecks } from "./People";
+import { CheckBanners, JoinWizard, SearchSelect, SystemAdmin, pill, roleLabel, useExamChecks } from "./People";
 
 const blankQuestion = () => ({ type: "mcq", prompt: "", a: "", b: "", c: "", d: "", answer: "A", marks: 1 });
 const field = "mt-1 w-full rounded-xl border border-stone-300 bg-white px-3 py-2.5 outline-none transition focus:border-stone-900 focus:ring-2 focus:ring-stone-900/10";
@@ -617,9 +617,14 @@ function SittingPage({ status, title, onOpen, onCounts }) {
           {
             data: null,
             title: status === "in_progress" ? "Time left" : "Marks",
-            render: (_data, _type, row) => status === "in_progress"
-              ? `${formatRemaining(row.remainingSeconds)} left`
-              : `${row.score} / ${row.maxScore}`
+            render: (_data, type, row) => {
+              if (status === "in_progress") {
+                const label = `${formatRemaining(row.remainingSeconds)} left`;
+                return type === "display" ? pill(label, "amber") : row.remainingSeconds;
+              }
+              const label = `${row.score} / ${row.maxScore}`;
+              return type === "display" ? pill(label, row.score > 0 ? "emerald" : "stone") : row.score;
+            }
           }
         ],
         language: {
@@ -668,19 +673,31 @@ function update(setQuestions, index, patch) {
 function Invigilator({ me, onLogout }) {
   const desk = useStaffDesk();
   const examChecks = useExamChecks(desk);
-  const [page, setPage] = useState("wall");
+  const [page, setPage] = useState("candidates");
   const [count, setCount] = useState(0);
+  const [assigned, setAssigned] = useState(0);
+
+  useEffect(() => {
+    let alive = true;
+    const load = () => api("/api/wall").then((rows) => { if (alive) setCount(rows.length); }).catch(() => {});
+    load();
+    const timer = setInterval(load, 5000);
+    return () => { alive = false; clearInterval(timer); };
+  }, []);
 
   return (
     <Desk
       me={me}
       onLogout={onLogout}
-      note="You see the candidates the manager assigned to you. Summary is the record uploaded when a paper ends."
+      note="Candidates lists everyone the manager assigned to you. Streams shows the ones who are in a paper."
       alerts={<StaffAlerts desk={desk} quiet />}
       nav={
         <>
+          <NavButton active={page === "candidates"} onClick={() => setPage("candidates")}>
+            Candidates <em className="rounded-full bg-amber-200 px-2 py-0.5 text-xs text-stone-950 not-italic">{assigned}</em>
+          </NavButton>
           <NavButton active={page === "wall"} onClick={() => setPage("wall")}>
-            Streams <em className="rounded-full bg-amber-200 px-2 py-0.5 text-xs text-stone-950 not-italic">{count}</em>
+            Streams <em className="rounded-full bg-emerald-200 px-2 py-0.5 text-xs text-stone-950 not-italic">{count}</em>
           </NavButton>
           <NavButton active={page === "summary"} onClick={() => setPage("summary")}>
             Summary {examChecks.checks.length > 0 && <em className="rounded-full bg-red-500 px-2 py-0.5 text-xs text-white not-italic">{examChecks.checks.length}</em>}
@@ -689,8 +706,59 @@ function Invigilator({ me, onLogout }) {
       }
     >
       <CheckBanners checks={examChecks.checks} sound={desk.sound} onSound={desk.enableSound} onSeen={examChecks.seen} onOpen={() => setPage("summary")} />
-      {page === "summary" ? <SummaryDesk /> : <LiveWall desk={desk} empty="No assigned candidate is in a paper. The manager chooses who appears here." onCount={setCount} />}
+      {page === "summary" ? <SummaryDesk /> : page === "wall" ? <LiveWall desk={desk} empty="No assigned candidate is in a paper right now." onCount={setCount} /> : <WatchList onCount={setAssigned} />}
     </Desk>
+  );
+}
+
+function WatchList({ onCount }) {
+  const hostRef = useRef(null);
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    api("/api/watch").then(setRows).catch((err) => setError(err.message));
+  }, []);
+
+  useEffect(() => { if (rows) onCount(rows.length); }, [rows]);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host || !rows) return undefined;
+    host.replaceChildren();
+    const table = document.createElement("table");
+    table.className = "display";
+    table.style.width = "100%";
+    host.appendChild(table);
+    const dt = new DataTable(table, {
+      data: rows,
+      columns: [
+        { data: "fullName", title: "Candidate" },
+        { data: "email", title: "Email" },
+        { data: "exams", title: "Exam", render: (value, type) => type === "display" ? pill(value || "No exam", value ? "stone" : "amber") : value },
+        { data: "status", title: "Status", render: (value, type) => type === "display" ? pill(value, String(value).startsWith("In ") ? "emerald" : "amber") : value }
+      ],
+      pageLength: 8,
+      lengthMenu: [8, 25, 50, 100],
+      order: [[0, "asc"]],
+      language: { emptyTable: "No candidate is assigned to you yet.", zeroRecords: "No matches.", search: "Search:", lengthMenu: "Show _MENU_", info: "Showing _START_ to _END_ of _TOTAL_" }
+    });
+    return () => {
+      try { dt.destroy(); } catch { /* The page already left. */ }
+      host.replaceChildren();
+    };
+  }, [rows]);
+
+  return (
+    <>
+      <header className="mb-6">
+        <h1 className="font-serif text-4xl">Your candidates</h1>
+        <p className="mt-1 max-w-2xl text-stone-500">Everyone the manager assigned to you, and the exam they were mapped to. Streams opens when one of them starts a paper.</p>
+      </header>
+      {error && <p className="mb-4 text-sm text-red-700">{error}</p>}
+      {!rows && !error && <p className="text-stone-500">Loading candidates…</p>}
+      <div ref={hostRef} className="rounded-3xl bg-white p-4 shadow-sm" />
+    </>
   );
 }
 
@@ -731,18 +799,22 @@ function SummaryDesk() {
           {
             data: "ended",
             title: "Ended",
-            render: (value, _type, row) => `${row.status === "expired" ? "Time up" : "Submitted"} · ${new Date(value).toLocaleString()}`
+            render: (value, type, row) => {
+              const label = row.status === "expired" ? "Time up" : "Submitted";
+              if (type !== "display") return `${label} ${value}`;
+              return `${pill(label, row.status === "expired" ? "red" : "emerald")} <span class="ml-2 text-stone-500">${new Date(value).toLocaleString()}</span>`;
+            }
           },
           {
             data: "warnings",
             title: "Warnings",
-            render: (value) => value > 4 ? `${value} · check them` : String(value)
+            render: (value, type) => type === "display" ? pill(value > 4 ? `${value} · check` : String(value), value > 4 ? "red" : "stone") : value
           },
           { data: "screenshots", title: "Screenshots" },
           {
             data: null,
             title: "Result",
-            render: (_data, _type, row) => `${row.score} / ${row.maxScore}`
+            render: (_data, type, row) => type === "display" ? pill(`${row.score} / ${row.maxScore}`, row.score > 0 ? "emerald" : "stone") : row.score
           },
           {
             data: "id",
@@ -921,7 +993,12 @@ function LiveWall({ desk, title, detail, empty, onCount }) {
               <div className="px-4 py-3">
                 <p className="font-medium">{student.studentName}</p>
                 <p className="text-sm text-stone-400">{student.paper}</p>
-                <p className="mt-1 text-sm">{formatRemaining(student.remainingSeconds)} left{raised ? " · Hand up" : ""}</p>
+                <div className="mt-2 flex flex-wrap gap-1">
+                  <span className="rounded-full bg-stone-800 px-2 py-0.5 text-xs font-medium text-stone-100">{formatRemaining(student.remainingSeconds)} left</span>
+                  {raised && <span className="rounded-full bg-red-500 px-2 py-0.5 text-xs font-medium text-white">Hand up</span>}
+                  {!student.camera && <span className="rounded-full bg-amber-200 px-2 py-0.5 text-xs font-medium text-amber-950">No camera</span>}
+                  {student.camera && !raised && <span className="rounded-full bg-emerald-200 px-2 py-0.5 text-xs font-medium text-emerald-950">Live</span>}
+                </div>
               </div>
             </button>
           );
@@ -1012,95 +1089,142 @@ function LiveVideo({ stream, sittingId, large }) {
   return (
     <div className={`relative overflow-hidden bg-stone-950 ${box}`}>
       <canvas ref={canvasRef} className={`h-full w-full object-cover ${seen ? "" : "invisible"}`} />
-      {!seen && <div className="absolute inset-0 grid place-items-center px-4 text-center text-sm text-stone-400">Waiting for the live camera</div>}
+      {!seen && <div className="absolute inset-0 grid place-items-center px-4"><span className="rounded-full bg-amber-200 px-3 py-1 text-xs font-medium text-amber-950">Waiting for the live camera</span></div>}
     </div>
   );
 }
 
 function AssignDesk() {
   const [roster, setRoster] = useState(null);
-  const [duties, setDuties] = useState(null);
+  const [examId, setExamId] = useState("");
+  const [invigilatorId, setInvigilatorId] = useState("");
+  const [picked, setPicked] = useState(0);
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const hostRef = useRef(null);
+  const selectedRef = useRef(new Set());
+  const tableRef = useRef(null);
 
   async function load() {
-    const [nextRoster, nextDuties] = await Promise.all([api("/api/roster"), api("/api/duties")]);
-    setRoster(nextRoster);
-    setDuties(nextDuties);
+    setRoster(await api("/api/roster"));
   }
 
   useEffect(() => { load().catch((err) => setError(err.message)); }, []);
 
-  async function assign(studentId, invigilatorId) {
+  const candidates = roster && examId
+    ? roster.students.filter((student) => student.examIds.includes(Number(examId)))
+    : [];
+  const invigilator = roster?.invigilators.find((item) => String(item.id) === String(invigilatorId));
+
+  useEffect(() => {
+    selectedRef.current = new Set();
+    setPicked(0);
+    const host = hostRef.current;
+    if (!host) return undefined;
+    host.replaceChildren();
+    if (!examId) return undefined;
+    const table = document.createElement("table");
+    table.className = "display";
+    table.style.width = "100%";
+    host.appendChild(table);
+    const dt = new DataTable(table, {
+      data: candidates,
+      columns: [
+        {
+          data: "id",
+          title: "",
+          orderable: false,
+          searchable: false,
+          width: "36px",
+          render: (id) => `<input type="checkbox" data-id="${id}" aria-label="Select candidate" ${selectedRef.current.has(id) ? "checked" : ""}>`
+        },
+        { data: "fullName", title: "Candidate" },
+        { data: "email", title: "Email" },
+        { data: "invigilatorName", title: "Invigilator", render: (value, type) => type === "display" ? pill(value || "Unassigned", value ? "emerald" : "amber") : (value || "Unassigned") }
+      ],
+      pageLength: 8,
+      order: [[1, "asc"]],
+      language: { emptyTable: "No candidate on this exam has joined yet.", zeroRecords: "No matches.", search: "Search:", lengthMenu: "Show _MENU_", info: "Showing _START_ to _END_ of _TOTAL_" }
+    });
+    tableRef.current = dt;
+    function onChange(event) {
+      const input = event.target;
+      if (!(input instanceof HTMLInputElement) || input.type !== "checkbox") return;
+      const id = Number(input.dataset.id);
+      if (!id) return;
+      const next = new Set(selectedRef.current);
+      if (input.checked) next.add(id);
+      else next.delete(id);
+      selectedRef.current = next;
+      setPicked(next.size);
+    }
+    host.addEventListener("change", onChange);
+    return () => {
+      host.removeEventListener("change", onChange);
+      tableRef.current = null;
+      try { dt.destroy(); } catch { /* The page already left. */ }
+      host.replaceChildren();
+    };
+  }, [examId, roster]);
+
+  function tickSearch() {
+    const dt = tableRef.current;
+    if (!dt) return;
+    const visible = dt.rows({ search: "applied" }).data().toArray().map((row) => row.id);
+    const next = new Set(selectedRef.current);
+    const allOn = visible.length > 0 && visible.every((id) => next.has(id));
+    visible.forEach((id) => { if (allOn) next.delete(id); else next.add(id); });
+    selectedRef.current = next;
+    setPicked(next.size);
+    dt.draw(false);
+  }
+
+  function chosenIds(everyone) {
+    if (everyone) return candidates.map((student) => student.id);
+    return [...selectedRef.current].filter((id) => candidates.some((student) => student.id === id));
+  }
+
+  async function assign(everyone) {
+    const studentIds = chosenIds(everyone);
+    if (!invigilatorId || studentIds.length === 0) return;
+    setBusy(true);
     setError("");
     try {
-      await api("/api/roster", { method: "POST", body: JSON.stringify({ studentId, invigilatorId }) });
+      await api("/api/roster/bulk", { method: "POST", body: JSON.stringify({ studentIds, invigilatorId: Number(invigilatorId) }) });
+      selectedRef.current = new Set();
+      setPicked(0);
       await load();
     } catch (err) {
       setError(err.message);
+    } finally {
+      setBusy(false);
     }
   }
 
-  async function duty(assessmentId, teacherId, assigned) {
-    setError("");
-    try {
-      await api("/api/duties", { method: "POST", body: JSON.stringify({ assessmentId, teacherId, assigned }) });
-      await load();
-    } catch (err) {
-      setError(err.message);
-    }
-  }
-
-  if (!roster || !duties) return <p className="text-stone-500">Loading assignments…</p>;
+  if (!roster) return <p className="text-stone-500">Loading assignments…</p>;
 
   return (
     <>
       <header className="mb-6">
         <h1 className="font-serif text-4xl">Assign invigilators</h1>
-        <p className="mt-1 max-w-2xl text-stone-500">Put any teacher on an exam. They hear the check shout for that paper and see its summary. A candidate can still be watched by a dedicated invigilator.</p>
+        <p className="mt-1 max-w-2xl text-stone-500">Pick the exam, then the invigilator. The table lists candidates already mapped to that exam. Search it, tick rows, and assign them together.</p>
       </header>
       {error && <p className="mb-4 text-sm text-red-700">{error}</p>}
-      <div className="mb-8 grid gap-4">
-        {duties.teachers.length === 0 && <p className="rounded-3xl bg-white px-4 py-6 text-stone-500">No teacher account yet. The system admin creates teachers.</p>}
-        {duties.exams.map((exam) => (
-          <article key={exam.id} className="rounded-3xl bg-white p-5 shadow-sm">
-            <h2 className="font-serif text-2xl">{exam.title}</h2>
-            <div className="mt-3 flex flex-col gap-2">
-              {duties.teachers.map((teacher) => (
-                <label key={teacher.id} className="flex items-center gap-3 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={exam.teacherIds.includes(teacher.id)}
-                    onChange={(event) => duty(exam.id, teacher.id, event.target.checked)}
-                  />
-                  <span>{teacher.fullName}</span>
-                  <span className="text-stone-500">{teacher.email}</span>
-                </label>
-              ))}
-            </div>
-          </article>
-        ))}
+      <div className="mb-4 grid gap-4 sm:grid-cols-2">
+        <SearchSelect label="Exam" value={examId} options={roster.exams.map((exam) => ({ id: exam.id, name: exam.title }))} placeholder="Search exams" onChange={setExamId} />
+        <SearchSelect label="Invigilator" value={invigilatorId} options={roster.invigilators.map((item) => ({ id: item.id, name: item.fullName, detail: item.email }))} placeholder="Search invigilators" onChange={setInvigilatorId} />
       </div>
-      <h2 className="mb-3 font-serif text-2xl">Candidates and dedicated invigilators</h2>
-      <div className="overflow-hidden rounded-3xl bg-white shadow-sm">
-        {roster.students.map((student) => (
-          <div key={student.id} className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3 last:border-0">
-            <div>
-              <p className="font-medium">{student.fullName}</p>
-              <p className="text-sm text-stone-500">{student.email}{student.paper ? ` · In ${student.paper}` : ""}</p>
-            </div>
-            <select
-              className="rounded-xl border border-stone-300 bg-white px-3 py-2 text-sm"
-              value={student.invigilatorId || ""}
-              onChange={(event) => assign(student.id, event.target.value ? Number(event.target.value) : null)}
-            >
-              <option value="">Unassigned</option>
-              {roster.invigilators.map((invigilator) => (
-                <option key={invigilator.id} value={invigilator.id}>{invigilator.fullName}</option>
-              ))}
-            </select>
-          </div>
-        ))}
+      <div className="mb-4 flex flex-wrap gap-2">
+        <button className={ghost} type="button" disabled={!examId || candidates.length === 0} onClick={tickSearch}>Tick this search</button>
+        <button className={primary} type="button" disabled={busy || !invigilator || picked === 0} onClick={() => assign(false)}>
+          {picked > 0 && invigilator ? `Assign ${picked} to ${invigilator.fullName}` : "Assign selected"}
+        </button>
+        <button className={ghost} type="button" disabled={busy || !invigilator || !examId || candidates.length === 0} onClick={() => assign(true)}>
+          {invigilator && examId ? `Assign everyone on this exam to ${invigilator.fullName}` : "Assign everyone on this exam"}
+        </button>
       </div>
+      {!examId && <p className="rounded-3xl bg-white px-4 py-6 text-stone-500">Choose an exam to see its candidates.</p>}
+      <div ref={hostRef} className={examId ? "rounded-3xl bg-white p-4 shadow-sm" : "hidden"} />
     </>
   );
 }

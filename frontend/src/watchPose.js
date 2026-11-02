@@ -8,27 +8,39 @@ let loading;
 
 export function loadWatchers() {
   if (!loading) {
-    loading = start().catch((error) => {
+    let markFace;
+    const faceReady = new Promise((resolve, reject) => { markFace = { resolve, reject }; });
+    const both = start(markFace).catch((error) => {
       loading = undefined;
+      markFace.reject(error);
       throw error;
     });
+    loading = { faceReady, both };
   }
   return loading;
 }
 
-async function start() {
+async function start(markFace) {
   const files = await FilesetResolver.forVisionTasks("/mediapipe");
-  const face = await open(FaceLandmarker, files, "/models/face_landmarker.task", {
-    runningMode: "VIDEO",
-    numFaces: 2,
-    outputFacialTransformationMatrixes: true,
-    outputFaceBlendshapes: false
-  });
-  const pose = await open(PoseLandmarker, files, "/models/pose_landmarker_lite.task", {
-    runningMode: "VIDEO",
-    numPoses: 1
-  });
-  return { face, pose };
+  const watchers = {
+    face: await open(FaceLandmarker, files, "/models/face_landmarker.task", {
+      runningMode: "VIDEO",
+      numFaces: 2,
+      outputFacialTransformationMatrixes: true,
+      outputFaceBlendshapes: false
+    }),
+    pose: null
+  };
+  markFace.resolve(watchers);
+  try {
+    watchers.pose = await open(PoseLandmarker, files, "/models/pose_landmarker_lite.task", {
+      runningMode: "VIDEO",
+      numPoses: 1
+    });
+  } catch {
+    watchers.pose = null;
+  }
+  return watchers;
 }
 
 async function open(Task, files, model, options) {
@@ -42,7 +54,7 @@ export function readPosture(watchers, video, now) {
   reading = true;
   try {
     const faces = watchers.face.detectForVideo(video, now);
-    const body = watchers.pose.detectForVideo(video, now);
+    const body = watchers.pose?.detectForVideo(video, now);
     const faceCount = faces.faceLandmarks?.length ?? 0;
     const headAway = faceCount === 1 && turnedAway(faces.facialTransformationMatrixes?.[0]);
     const handEar = wristAtEar(body.landmarks?.[0]);

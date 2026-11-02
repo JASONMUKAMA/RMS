@@ -19,6 +19,17 @@ export function roleLabel(role) {
   return roleOptions.find(([value]) => value === role)?.[1] || role;
 }
 
+export function pill(text, tone = "stone") {
+  const tones = {
+    amber: "bg-amber-200 text-amber-950",
+    emerald: "bg-emerald-200 text-emerald-950",
+    red: "bg-red-100 text-red-900",
+    stone: "bg-stone-200 text-stone-800"
+  };
+  const safe = String(text ?? "").replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[char]));
+  return `<span class="inline-flex rounded-full px-2.5 py-0.5 text-xs font-medium ${tones[tone] || tones.stone}">${safe}</span>`;
+}
+
 export function useExamChecks(desk) {
   const [checks, setChecks] = useState([]);
 
@@ -301,7 +312,7 @@ export function JoinWizard({ onDone, onBack }) {
   );
 }
 
-function SearchSelect({ label, value, options, onChange, placeholder = "Search", disabled = false, loading = false }) {
+export function SearchSelect({ label, value, options, onChange, placeholder = "Search", disabled = false, loading = false }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
@@ -309,7 +320,7 @@ function SearchSelect({ label, value, options, onChange, placeholder = "Search",
   const list = useRef(null);
   const selected = options.find((item) => String(item.id) === String(value));
   const needle = query.trim().toLowerCase();
-  const filtered = needle ? options.filter((item) => item.name.toLowerCase().includes(needle)) : options;
+  const filtered = needle ? options.filter((item) => `${item.name} ${item.detail || ""}`.toLowerCase().includes(needle)) : options;
 
   useEffect(() => {
     function outside(event) {
@@ -414,7 +425,10 @@ function SearchSelect({ label, value, options, onChange, placeholder = "Search",
                     onMouseEnter={() => setActive(index)}
                     onClick={() => pick(item)}
                   >
-                    <span>{markMatch(item.name, needle)}</span>
+                    <span className="min-w-0">
+                      <span className="block">{markMatch(item.name, needle)}</span>
+                      {item.detail && <span className={`block text-xs ${current ? "text-stone-300" : "text-stone-500"}`}>{item.detail}</span>}
+                    </span>
                     {chosen && <span className={current ? "text-amber-300" : "text-amber-700"}>✓</span>}
                   </button>
                 </li>
@@ -672,19 +686,24 @@ function PeopleTable({ me, push }) {
           {
             data: null,
             title: "Role",
-            render: (_data, _type, row) => {
-              if (Number(row.id) === me.id) return roleLabel(row.role);
-              return `<select data-role="${row.id}" class="rounded-lg border border-stone-300 bg-white px-2 py-1 text-sm">${roleOptions.map(([value, label]) => `<option value="${value}"${value === row.role ? " selected" : ""}>${label}</option>`).join("")}</select>`;
+            render: (_data, type, row) => {
+              if (type !== "display") return roleLabel(row.role);
+              if (Number(row.id) === me.id) return pill(roleLabel(row.role), "stone");
+              return `<select data-role="${row.id}" class="rounded-full border border-stone-300 bg-white px-3 py-1 text-xs font-medium">${roleOptions.map(([value, label]) => `<option value="${value}"${value === row.role ? " selected" : ""}>${label}</option>`).join("")}</select>`;
             }
           },
           {
             data: null,
             title: "Account",
             orderable: false,
-            render: (_data, _type, row) => {
+            render: (_data, type, row) => {
               const on = Number(row.active) === 1;
-              if (Number(row.id) === me.id) return on ? "On" : "Off";
-              return `<button type="button" class="rounded-full border border-stone-300 px-3 py-1 text-xs font-medium" data-active="${row.id}" data-on="${on ? 0 : 1}">${on ? "Switch off" : "Switch on"}</button>`;
+              if (type !== "display") return on ? "On" : "Off";
+              if (Number(row.id) === me.id) return pill(on ? "On" : "Off", on ? "emerald" : "stone");
+              const klass = on
+                ? "rounded-full border border-stone-300 bg-white px-3 py-1 text-xs font-medium text-stone-800"
+                : "rounded-full bg-emerald-700 px-3 py-1 text-xs font-medium text-white";
+              return `<button type="button" class="${klass}" data-active="${row.id}" data-on="${on ? 0 : 1}">${on ? "Switch off" : "Switch on"}</button>`;
             }
           }
         ],
@@ -781,9 +800,9 @@ function InviteTable() {
         ajax: { url: "/api/invites" },
         columns: [
           { data: "email", title: "Email" },
-          { data: "test", title: "Test", render: (value) => value || "Not set" },
+          { data: "test", title: "Test", render: (value, type) => type !== "display" ? (value || "Not set") : value ? pill(value, "stone") : pill("Not set", "amber") },
           { data: "createdAt", title: "Uploaded", render: (value) => value ? new Date(value).toLocaleString() : "" },
-          { data: "usedAt", title: "Wizard", render: (value) => value ? "Joined" : "Waiting" }
+          { data: "usedAt", title: "Wizard", render: (value, type) => type !== "display" ? (value ? "Joined" : "Waiting") : value ? pill("Joined", "emerald") : pill("Waiting", "amber") }
         ],
         language: { emptyTable: "No emails uploaded yet.", zeroRecords: "No matches.", search: "Search:", lengthMenu: "Show _MENU_", info: "Showing _START_ to _END_ of _TOTAL_" }
       });
@@ -900,8 +919,8 @@ function MailTable({ onOpen }) {
         columns: [
           { data: "toEmail", title: "To" },
           { data: "subject", title: "Subject" },
-          { data: "kind", title: "Kind" },
-          { data: "status", title: "Status" },
+          { data: "kind", title: "Kind", render: (value, type) => type !== "display" ? value : pill(value || "Note", "stone") },
+          { data: "status", title: "Status", render: (value, type) => type !== "display" ? value : pill(value === "sent" ? "Sent" : value === "held" ? "Held" : value || "Failed", value === "sent" ? "emerald" : value === "held" ? "amber" : "red") },
           { data: "createdAt", title: "When", render: (value) => value ? new Date(value).toLocaleString() : "" },
           {
             data: "id",

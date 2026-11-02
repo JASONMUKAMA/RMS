@@ -3,5 +3,6 @@ backend/RMS.Api/models/
 frontend/node_modules/
 frontend/dist/
 *.user
+certs/
 bin/
 obj/

@@ -31,7 +31,16 @@ function remainingFrom(sync, nowMs) {
   return Math.max(0, Math.ceil((ends - (nowMs + skew)) / 1000));
 }
 
+function cameraBlocked() {
+  return !window.isSecureContext || !navigator.mediaDevices?.getUserMedia;
+}
+
 async function openCamera() {
+  if (cameraBlocked()) {
+    const blocked = new Error("The camera is blocked on this address.");
+    blocked.name = "SecurityError";
+    throw blocked;
+  }
   const attempts = [
     { video: { facingMode: "user", width: { ideal: 640 } }, audio: false },
     { video: true, audio: false }
@@ -48,7 +57,14 @@ async function openCamera() {
   throw last ?? new Error("The camera did not start.");
 }
 
+function watchBadge(watch) {
+  if (/missing|second|turned away|at ear|stopped|did not/i.test(watch)) return "bg-red-500 text-white";
+  if (/looking at the paper/i.test(watch)) return "bg-emerald-200 text-emerald-950";
+  return "bg-amber-200 text-amber-950";
+}
+
 function cameraFailure(err) {
+  if (err?.name === "SecurityError") return "This page is http, so the browser will not start the camera. Open the questions to continue.";
   if (err?.name === "NotAllowedError") return "The browser blocked the camera. Allow it in the address bar, then try again.";
   if (err?.name === "NotReadableError") return "The camera is already open in another window. Close that window, then try again.";
   if (err?.name === "NotFoundError") return "This browser cannot find a camera. Connect one, then try again.";
@@ -261,15 +277,17 @@ export default function ExamRoom({ sittingId, onLeave }) {
   useEffect(() => {
     if (sync?.status !== "in_progress") return undefined;
     let alive = true;
-    loadWatchers()
-      .then((loaded) => {
-        if (!alive) return;
-        watchersRef.current = loaded;
-        setModels("ready");
-      })
-      .catch(() => {
-        if (alive) setModels("failed");
-      });
+    const watchers = loadWatchers();
+    watchers.faceReady.then((loaded) => {
+      if (!alive) return;
+      watchersRef.current = loaded;
+      setModels("ready");
+    }).catch(() => {
+      if (alive) setModels("failed");
+    });
+    watchers.both.then((loaded) => {
+      if (alive) watchersRef.current = loaded;
+    }).catch(() => {});
     return () => { alive = false; };
   }, [sync?.status]);
 
@@ -534,15 +552,22 @@ export default function ExamRoom({ sittingId, onLeave }) {
     "second-face": "Recorded: a second face is in the camera.",
     "head-away": "Recorded: the head stayed turned away.",
     "hand-ear": "Recorded: a hand stayed at an ear.",
-    "camera-interrupted": "Recorded: the camera stopped."
+    "camera-interrupted": "Recorded: the camera stopped.",
+    "camera-off": "Recorded: the camera stayed off."
   };
+  const questionsOpen = camera === "live" || camera === "without";
 
   return (
     <main className="min-h-screen bg-stone-100 text-stone-900">
       <div className="sticky top-0 z-20 flex flex-wrap items-center justify-between gap-4 border-b border-stone-200 bg-white/95 px-5 py-4 backdrop-blur">
         <div>
-          <button className="rounded-full border border-stone-300 px-4 py-2 text-sm font-medium text-stone-700 hover:bg-stone-50" type="button" onClick={() => setLeaveAsk(true)}>Leave exam</button>
-          <div className="mt-1 text-sm text-stone-500">{sync.title}</div>
+          <button className="rounded-full border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-800 shadow-sm hover:bg-stone-50" type="button" onClick={() => setLeaveAsk(true)}>Leave exam</button>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <span className="rounded-full bg-stone-200 px-2.5 py-0.5 text-xs font-medium text-stone-800">{sync.title}</span>
+            {hand === "up" && <span className="rounded-full bg-red-600 px-2.5 py-0.5 text-xs font-medium text-white">Hand up</span>}
+            {hand === "seen" && <span className="rounded-full bg-emerald-200 px-2.5 py-0.5 text-xs font-medium text-emerald-950">Hand seen</span>}
+            {camera === "without" && <span className="rounded-full bg-amber-200 px-2.5 py-0.5 text-xs font-medium text-amber-950">Camera off</span>}
+          </div>
           <div className={`font-serif text-5xl tabular-nums ${clockTone}`}>{formatClock(remaining)}</div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -573,7 +598,10 @@ export default function ExamRoom({ sittingId, onLeave }) {
       {localAlert && <div className="bg-amber-50 px-5 py-2 text-sm text-amber-950">{alertCopy[localAlert]}</div>}
       {error && <p className="px-5 py-2 text-sm text-red-700">{error}</p>}
 
-      {camera !== "live" ? (
+      {questionsOpen && camera === "without" && (
+        <div className="bg-amber-50 px-5 py-3 text-sm text-amber-950" role="status">The camera is off. This address is not secure, so the browser will not start it. The invigilator has no preview.</div>
+      )}
+      {!questionsOpen ? (
         <section className="mx-auto mt-10 max-w-xl rounded-3xl bg-white p-8 shadow-xl">
           <p className="text-xs tracking-[0.16em] text-amber-800">CAMERA</p>
           <h1 className="mt-2 font-serif text-4xl">{camera === "lost" ? "The camera stopped" : "Turn the camera on"}</h1>
@@ -583,8 +611,12 @@ export default function ExamRoom({ sittingId, onLeave }) {
           </p>
           <p className="mt-3 text-sm text-stone-500">Face and posture models run in this browser. A missing face, a second face, a head turned away, or a hand at an ear is recorded after it holds. The first time each one holds, one still is kept. Short answers of 30 characters or more are compared on the server.</p>
           <p className="mt-3 text-sm font-medium text-stone-800">{models === "ready" ? "Face and posture models are ready." : models === "failed" ? "The camera models did not start. The preview can still go on." : "Loading face and posture models…"}</p>
-          {cameraError && <p className="mt-3 text-sm text-red-700">{cameraError}</p>}
-          <button className="mt-6 rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50 shadow-sm hover:bg-stone-800" type="button" onClick={allowCamera}>Allow camera</button>
+          {(cameraError || cameraBlocked()) && <p className="mt-3 text-sm text-red-700">{cameraError || "This page is http, so the browser will not start the camera. Open the secure desk, accept the warning, then enter the paper again."}</p>}
+          <div className="mt-6 flex flex-wrap gap-2">
+            {cameraBlocked() && <a className="rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50 shadow-sm hover:bg-stone-800" href={`https://${window.location.hostname}:8443/`}>Open the secure desk</a>}
+            <button className="rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50 shadow-sm hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-40" type="button" disabled={cameraBlocked()} onClick={allowCamera}>Allow camera</button>
+            <button className="rounded-full border border-stone-300 px-5 py-2.5 text-sm font-medium text-stone-800 hover:bg-stone-50" type="button" onClick={() => { setCamera("without"); reportRef.current("camera-off"); }}>Open the questions</button>
+          </div>
         </section>
       ) : (
         <div className="mx-auto max-w-3xl px-5 py-6">
@@ -674,10 +706,16 @@ export default function ExamRoom({ sittingId, onLeave }) {
       )}
 
       {camera === "live" && (
-        <div className="fixed bottom-4 right-4 w-52 overflow-hidden rounded-2xl bg-stone-950 text-stone-100 shadow-2xl">
-          <video ref={videoRef} autoPlay muted playsInline className="aspect-video w-full object-cover" />
-          <p className="px-3 py-2 text-xs">Your camera is on the invigilator desk.</p>
-          <p className="px-3 pb-3 text-xs text-amber-200">{watch}</p>
+        <div className="fixed bottom-4 right-4 w-64 overflow-hidden rounded-3xl bg-stone-950 shadow-2xl">
+          <div className="relative">
+            <video ref={videoRef} autoPlay muted playsInline className="aspect-video w-full object-cover" />
+            <div className="absolute left-2 top-2 flex flex-wrap gap-1">
+              <span className="rounded-full bg-emerald-200 px-2.5 py-0.5 text-[11px] font-medium text-emerald-950">On the desk</span>
+            </div>
+            <div className="absolute bottom-2 left-2 right-2">
+              <span className={`inline-flex max-w-full rounded-full px-2.5 py-0.5 text-[11px] font-medium ${watchBadge(watch)}`}>{watch}</span>
+            </div>
+          </div>
         </div>
       )}
     </main>

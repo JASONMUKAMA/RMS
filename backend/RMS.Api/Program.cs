@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Authentication;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.AspNetCore.ResponseCompression;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
@@ -49,11 +50,15 @@ builder.Services.AddCors(options =>
 var app = builder.Build();
 app.UseResponseCompression();
 app.UseDefaultFiles();
+var staticTypes = new FileExtensionContentTypeProvider();
+staticTypes.Mappings[".task"] = "application/octet-stream";
 app.UseStaticFiles(new StaticFileOptions
 {
+    ContentTypeProvider = staticTypes,
     OnPrepareResponse = context =>
     {
-        if (context.Context.Request.Path.StartsWithSegments("/assets"))
+        var path = context.Context.Request.Path;
+        if (path.StartsWithSegments("/assets") || path.StartsWithSegments("/mediapipe") || path.StartsWithSegments("/models"))
             context.Context.Response.Headers.CacheControl = "public,max-age=31536000,immutable";
     }
 });
@@ -459,6 +464,51 @@ app.MapPost("/api/sittings/{id:int}/expire", async (int id, ClaimsPrincipal user
     return Results.Ok(await SittingView.Build(db, sitting, now));
 }).RequireAuthorization();
 
+app.MapGet("/api/watch", async (ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) != "invigilator")
+        return Results.Forbid();
+
+    var connection = await Sql.Open(db);
+    await using var command = Sql.Prepare(connection, """
+        SELECT u."Id", u."FullName", u."Email",
+            COALESCE((
+                SELECT string_agg(DISTINCT a."Title", ', ' ORDER BY a."Title")
+                FROM "Invites" i
+                JOIN "Assessments" a ON a."Id" = i."AssessmentId"
+                WHERE lower(i."Email") = lower(u."Email")
+            ), '') AS "Exams",
+            (
+                SELECT paper."Title"
+                FROM "Sittings" s
+                JOIN "Assessments" paper ON paper."Id" = s."AssessmentId"
+                WHERE s."StudentId" = u."Id" AND s."Status" = 'in_progress'
+                ORDER BY s."Id" DESC
+                LIMIT 1
+            ) AS "Sitting"
+        FROM "Assignments" duty
+        JOIN "Users" u ON u."Id" = duty."StudentId"
+        WHERE duty."InvigilatorId" = $id
+        ORDER BY u."FullName"
+        """);
+    command.Parameters.Add(Sql.Param("$id", int.Parse(user.FindFirstValue(ClaimTypes.NameIdentifier)!)));
+    var rows = new List<object>();
+    await using var reader = await command.ExecuteReaderAsync();
+    while (await reader.ReadAsync())
+    {
+        var sitting = reader.IsDBNull(4) ? null : reader.GetString(4);
+        rows.Add(new
+        {
+            id = reader.GetInt32(0),
+            fullName = reader.GetString(1),
+            email = reader.GetString(2),
+            exams = reader.IsDBNull(3) || reader.GetString(3).Length == 0 ? "No exam" : reader.GetString(3),
+            status = sitting is null ? "Waiting" : $"In {sitting}"
+        });
+    }
+    return Results.Ok(rows);
+}).RequireAuthorization();
+
 app.MapGet("/api/wall", async (ClaimsPrincipal user, AppDb db) =>
 {
     if (user.FindFirstValue(ClaimTypes.Role) is not ("invigilator" or "superadmin" or "teacher"))
@@ -791,25 +841,73 @@ app.MapGet("/api/roster", async (ClaimsPrincipal user, AppDb db) =>
 
     var people = await db.Users.AsNoTracking().OrderBy(item => item.FullName).ToListAsync();
     var assignments = await db.Assignments.AsNoTracking().ToListAsync();
-    var open = await (
-        from sitting in db.Sittings.AsNoTracking()
-        join paper in db.Assessments.AsNoTracking() on sitting.AssessmentId equals paper.Id
-        where sitting.Status == SittingStatus.InProgress
-        select new { sitting.StudentId, paper.Title }
-    ).ToListAsync();
+    var exams = await db.Assessments.AsNoTracking().OrderBy(item => item.Title).Select(item => new { item.Id, item.Title }).ToListAsync();
+    var examIds = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
+    var connection = await Sql.Open(db);
+    await using (var command = Sql.Prepare(connection, "SELECT \"Email\", \"AssessmentId\" FROM \"Invites\" WHERE \"AssessmentId\" IS NOT NULL"))
+    await using (var reader = await command.ExecuteReaderAsync())
+    {
+        while (await reader.ReadAsync())
+        {
+            var email = reader.GetString(0);
+            if (!examIds.TryGetValue(email, out var papers))
+            {
+                papers = [];
+                examIds[email] = papers;
+            }
+            var paper = reader.GetInt32(1);
+            if (!papers.Contains(paper))
+                papers.Add(paper);
+        }
+    }
 
+    var names = people.ToDictionary(item => item.Id, item => item.FullName);
     return Results.Ok(new
     {
-        invigilators = people.Where(item => item.Role == "invigilator").Select(item => new { item.Id, item.FullName, item.Email }),
-        students = people.Where(item => item.Role == "student").Select(item => new
+        exams,
+        invigilators = people.Where(item => item.Role == "invigilator" && item.Active).Select(item => new { item.Id, item.FullName, item.Email }),
+        students = people.Where(item => item.Role == "student").Select(item =>
         {
-            item.Id,
-            item.FullName,
-            item.Email,
-            invigilatorId = assignments.FirstOrDefault(row => row.StudentId == item.Id)?.InvigilatorId,
-            paper = open.FirstOrDefault(row => row.StudentId == item.Id)?.Title
+            var watch = assignments.FirstOrDefault(row => row.StudentId == item.Id)?.InvigilatorId;
+            return new
+            {
+                item.Id,
+                item.FullName,
+                item.Email,
+                invigilatorId = watch,
+                invigilatorName = watch is int id && names.TryGetValue(id, out var name) ? name : "",
+                examIds = examIds.TryGetValue(item.Email, out var papers) ? papers : []
+            };
         })
     });
+}).RequireAuthorization();
+
+app.MapPost("/api/roster/bulk", async (RosterBulk body, ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) != "superadmin")
+        return Results.Forbid();
+
+    var ids = (body.StudentIds ?? []).Distinct().ToList();
+    if (ids.Count == 0)
+        return Results.BadRequest(new { error = "Choose candidates." });
+    var watch = await db.Users.FirstOrDefaultAsync(item => item.Id == body.InvigilatorId && item.Role == "invigilator" && item.Active);
+    if (watch is null)
+        return Results.BadRequest(new { error = "Choose an invigilator." });
+
+    var students = await db.Users.Where(item => ids.Contains(item.Id) && item.Role == "student").Select(item => item.Id).ToListAsync();
+    if (students.Count == 0)
+        return Results.BadRequest(new { error = "Choose a candidate." });
+    var existing = await db.Assignments.Where(item => students.Contains(item.StudentId)).ToListAsync();
+    foreach (var id in students)
+    {
+        var row = existing.FirstOrDefault(item => item.StudentId == id);
+        if (row is null)
+            db.Assignments.Add(new Assignment { StudentId = id, InvigilatorId = watch.Id });
+        else
+            row.InvigilatorId = watch.Id;
+    }
+    await db.SaveChangesAsync();
+    return Results.Ok(new { assigned = students.Count });
 }).RequireAuthorization();
 
 app.MapPost("/api/roster", async (RosterWrite body, ClaimsPrincipal user, AppDb db) =>
@@ -911,6 +1009,7 @@ static Task NotifyExpired(IHubContext<DeskHub> hub, Sitting sitting) =>
 public sealed record LoginRequest(string Email, string Password);
 
 public sealed record RosterWrite(int StudentId, int? InvigilatorId);
+public sealed record RosterBulk(List<int>? StudentIds, int InvigilatorId);
 public sealed record StartSitting(int AssessmentId);
 public sealed record SaveAnswer(int QuestionId, string Response);
 public sealed record WarningWrite(string Kind);
