@@ -2,10 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import DataTable from "datatables.net-dt";
 import "datatables.net-dt/css/dataTables.dataTables.css";
 import { api } from "./api";
+import { NavIcon } from "./icons";
 
-const field = "mt-1 w-full rounded-xl border border-stone-300 bg-white px-3 py-2.5 outline-none transition focus:border-stone-900 focus:ring-2 focus:ring-stone-900/10";
-const primary = "inline-flex items-center justify-center gap-2 rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50 shadow-sm transition hover:bg-stone-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-stone-950 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:text-stone-500";
-const ghost = "inline-flex items-center justify-center gap-2 rounded-full border border-stone-300 bg-white px-5 py-2.5 text-sm font-medium text-stone-800 shadow-sm transition hover:border-stone-400 hover:bg-stone-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-stone-400 disabled:cursor-not-allowed disabled:opacity-50";
+const field = "mt-1 w-full rounded border border-[#bdbdbd] bg-white px-3 py-2.5 text-sm outline-none transition focus:border-[#3b71ca] focus:shadow-[0_1px_0_0_#3b71ca]";
+const primary = "inline-flex items-center justify-center gap-2 rounded bg-[#3b71ca] px-5 py-2.5 text-xs font-medium uppercase tracking-wider text-white shadow-[0_4px_9px_-4px_#3b71ca] transition hover:bg-[#386bc0] hover:shadow-[0_8px_9px_-4px_rgba(59,113,202,0.45)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3b71ca] disabled:cursor-not-allowed disabled:bg-[#e0e0e0] disabled:text-[#9e9e9e] disabled:shadow-none";
+const ghost = "inline-flex items-center justify-center gap-2 rounded border-2 border-[#3b71ca] bg-white px-5 py-2.5 text-xs font-medium uppercase tracking-wider text-[#3b71ca] transition hover:bg-[#3b71ca] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3b71ca] disabled:cursor-not-allowed disabled:opacity-50";
 
 const roleOptions = [
   ["student", "Candidate"],
@@ -28,6 +29,117 @@ export function pill(text, tone = "stone") {
   };
   const safe = String(text ?? "").replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[char]));
   return `<span class="inline-flex rounded-full px-2.5 py-0.5 text-xs font-medium ${tones[tone] || tones.stone}">${safe}</span>`;
+}
+
+const helpCopy = {
+  guest: [
+    ["Sign in", [
+      "Staff and candidates who have already joined use the email and password on the sign-in form.",
+      "A candidate whose email is on the invitation sheet, and who has not joined yet, chooses I have an invitation.",
+      "The wizard asks for the name, phone, NIN, date of birth, and village. Search each place list. The village you pick fills the address."
+    ]],
+    ["After you are in", [
+      "The side menu matches your role. Help there repeats only the notes for that work.",
+      "Sign out is the button at the bottom of the menu."
+    ]]
+  ],
+  student: [
+    ["Your papers", [
+      "To take lists only the exams mapped to your email. A paper that is not on your invitation does not appear.",
+      "Start asks you to prepare first. The clock starts only after you continue. Resume returns to the same sitting. The clock does not reset.",
+      "Before Section A ends, the desk warns you if an objective is blank or the saved answers are below 70%. You can go back and change them.",
+      "Section A is the objectives. The system marks it when you submit. At 70% or more, Section B (the written paper) opens in the same sitting. Below 70% the result is Fail and Section B stays closed.",
+      "Section B is not marked by the system. Submit it and the answers are saved. The examiner and the manager award those marks afterwards.",
+      "You get an email for a pass and for a fail, with the Section A marks. A second email arrives when the written marks are awarded.",
+      "Finished keeps a fail, a paper waiting for the examiner, and a marked paper. A paper that ran out during Section A scores nothing."
+    ]],
+    ["Camera, hand, and the clock", [
+      "Allow the camera when the address is https. On a plain http page the browser will not start it. Choose Open the questions and continue. The invigilator then has no preview.",
+      "Raise hand sends an alert to your invigilator. It is available once the camera preview is live. The note is optional.",
+      "Stay in this window. Leaving it, copying, or pasting is recorded.",
+      "Submit before the clock ends. Under twenty minutes the bar is warm. Under five it is heavy. At zero during Section A the paper fails. At zero during Section B the written answers are saved."
+    ]]
+  ],
+  invigilator: [
+    ["Who you are watching", [
+      "Candidates lists everyone the manager assigned to you, including people who have not started.",
+      "Streams shows the ones who are in a paper. Waiting for the live camera means their preview has not started.",
+      "You do not put people on an exam. The manager does that from Assign."
+    ]],
+    ["Alerts", [
+      "A red hand-up banner is a candidate asking for help. Turn the alert sound on once in the browser so the shout can play. Choose Seen when you have dealt with it.",
+      "Summary holds closed papers and the checks opened after several warnings on one sitting."
+    ]]
+  ],
+  teacher: [
+    ["Put a paper on the desk", [
+      "Write exam is for typing the questions here. Each one is A to D, or you save it from this page.",
+      "Upload exam reads Excel, CSV, or Word. Excel and CSV use a header row: prompt, a, b, c, d, answer, marks. The answer is A, B, C, or D. For a short question, leave a to d empty and put the model answer in answer.",
+      "A Word file can keep A) to D) in one options cell, and can include true or false lines, short questions, and scenarios. If that file has no answers, add the answer sheet in the second box before you upload."
+    ]],
+    ["While a paper is running", [
+      "Undertaking is the list of sittings still open, including someone who has passed Section A and is on the written paper.",
+      "Submitted lists fails, time-ups, written answers waiting for marks, and marked papers.",
+      "Streams shows a live camera when the candidate has allowed it. Summary is the closed record.",
+      "A candidate sees a paper only after their invitation names that paper."
+    ]],
+    ["Mark written", [
+      "Objectives are Section A and are marked by the system. Written questions and scenarios are Section B.",
+      "Mark written lists candidates who reached 70% on Section A and handed in Section B. Award each question from zero up to its marks.",
+      "Saving the marks emails the candidate the Section A marks, the written marks, and the total."
+    ]]
+  ],
+  superadmin: [
+    ["Assign", [
+      "Assign has two tabs. Assign invigilator puts the ticked candidates with a teacher, a manager, or an invigilator. Assign candidate puts the ticked candidates on an exam.",
+      "A candidate has one person watching them. Assigning them again replaces the previous person. The same person can be on more than one exam."
+    ]],
+    ["Audit", [
+      "Audit records sign-ins, failed sign-ins, staff and role changes, invitation uploads, exams, assignments, and papers started, submitted, or closed."
+    ]]
+  ],
+  systemadmin: [
+    ["Staff and roles", [
+      "Create staff is for teachers, invigilators, managers, and other system admins. Candidates are not created here. They join from an uploaded email.",
+      "Roles lists every account. Change a role or switch an account off. That person should sign in again afterwards.",
+      "You cannot change your own role, and you cannot switch off the account you are using. At least one system admin has to remain."
+    ]],
+    ["Candidates", [
+      "Upload emails needs two columns: email and test. The test is the paper title and must match one exam already on the desk. The same email may have several tests, one row each.",
+      "Unknown titles are skipped and reported. Uploaded emails shows who is still waiting and who has joined."
+    ]],
+    ["Desk", [
+      "Places is the district-to-village list the join wizard searches.",
+      "Outbox keeps welcome messages, Section A pass and fail results, and written marks. They are sent when a mail server is configured. Until then the status stays held.",
+      "Audit records who signed in, who changed a role, and who uploaded, assigned, started, or submitted a paper."
+    ]]
+  ]
+};
+
+export function HelpGuide({ role }) {
+  const groups = role ? [role === "superadmin" ? "teacher" : null, role].filter(Boolean) : ["guest"];
+  const blocks = groups.flatMap((key) => helpCopy[key] || []);
+  return (
+    <>
+      <header className="mb-6">
+        <p className="text-xs font-medium tracking-[0.16em] text-amber-800">HELP</p>
+        <h1 className="mt-1 font-serif text-4xl">How this desk works</h1>
+        <p className="mt-1 max-w-2xl text-stone-500">
+          {role ? `These notes are for a ${roleLabel(role).toLowerCase()}.` : "Sign in if you already have an account. Use the invitation if your email was uploaded and you have not joined."}
+        </p>
+      </header>
+      <div className="grid max-w-3xl gap-4">
+        {blocks.map(([title, steps]) => (
+          <article className="rounded-3xl bg-white p-6 shadow-sm" key={title}>
+            <h2 className="font-serif text-2xl">{title}</h2>
+            <ul className="mt-3 space-y-2 text-sm leading-6 text-stone-700">
+              {steps.map((step) => <li key={step}>{step}</li>)}
+            </ul>
+          </article>
+        ))}
+      </div>
+    </>
+  );
 }
 
 export function useExamChecks(desk) {
@@ -232,13 +344,13 @@ export function JoinWizard({ onDone, onBack }) {
   const youngest = new Date(today.getFullYear() - 16, today.getMonth(), today.getDate()).toISOString().slice(0, 10);
 
   return (
-    <main className="min-h-screen bg-stone-100 px-4 py-10">
-      <form className="mx-auto w-full max-w-lg rounded-3xl bg-white p-6 shadow-xl shadow-stone-200" onSubmit={next}>
-        <p className="text-xs tracking-[0.22em] text-amber-700">RMS · Candidate record</p>
+    <main className="min-h-screen bg-[#fbfbfb] px-4 py-10">
+      <form className="mx-auto w-full max-w-lg rounded-lg bg-white p-6 shadow-[0_2px_15px_-3px_rgba(0,0,0,0.07),0_10px_20px_-2px_rgba(0,0,0,0.04)]" onSubmit={next}>
+        <p className="text-xs font-medium uppercase tracking-[0.16em] text-[#3b71ca]">RMS · Candidate record</p>
         <p className="mt-3 text-sm text-stone-500">Step {step + 1} of 7</p>
         <div className="mt-3 flex gap-1" aria-hidden="true">
           {titles.map((title, index) => (
-            <span key={title} className={`h-1.5 flex-1 rounded-full ${index <= step ? "bg-stone-950" : "bg-stone-200"}`} />
+            <span key={title} className={`h-1.5 flex-1 rounded-full ${index <= step ? "bg-[#3b71ca]" : "bg-[#e0e0e0]"}`} />
           ))}
         </div>
         <h1 className="mt-5 font-serif text-4xl">{titles[step]}</h1>
@@ -459,16 +571,18 @@ function markMatch(name, needle) {
 
 function DeskShell({ me, onLogout, nav, note, children }) {
   return (
-    <div className="min-h-screen bg-stone-100 text-stone-900 md:grid md:grid-cols-[260px_1fr]">
-      <aside className="flex flex-col gap-6 bg-stone-950 px-4 py-5 text-stone-100 md:sticky md:top-0 md:h-screen">
-        <div>
-          <p className="text-xs tracking-[0.22em] text-amber-200">RMS</p>
-          <strong className="mt-3 block font-serif text-2xl font-medium">{me.fullName}</strong>
-          <em className="mt-1 block text-sm text-stone-400 not-italic">System admin</em>
+    <div className="min-h-screen bg-[#fbfbfb] text-[#4f4f4f] md:grid md:grid-cols-[260px_1fr]">
+      <aside className="flex flex-col border-r border-black/5 border-t-4 border-t-[#3b71ca] bg-white px-3 py-5 shadow-[0_2px_15px_-3px_rgba(0,0,0,0.07)] md:sticky md:top-0 md:h-screen md:overflow-hidden">
+        <div className="shrink-0 px-2">
+          <p className="text-xs font-medium uppercase tracking-[0.16em] text-[#3b71ca]">RMS</p>
+          <strong className="mt-2 block text-lg font-medium text-[#332d2d]">{me.fullName}</strong>
+          <em className="mt-0.5 block text-sm text-[#757575] not-italic">System admin</em>
         </div>
-        <nav className="flex flex-col gap-1">{nav}</nav>
-        <p className="mt-auto text-xs leading-5 text-stone-400">{note}</p>
-        <button className="rounded-full border border-white/15 px-4 py-2 text-sm text-stone-200 hover:bg-white/10" type="button" onClick={onLogout}>Sign out</button>
+        <nav className="mt-6 flex flex-col gap-1 md:min-h-0 md:flex-1 md:overflow-y-auto">{nav}</nav>
+        <div className="shrink-0 space-y-3 pt-4">
+          <p className="line-clamp-3 px-2 text-xs leading-5 text-[#757575]">{note}</p>
+          <button className="flex w-full items-center justify-center gap-2 rounded border-2 border-[#3b71ca] px-4 py-2 text-xs font-medium uppercase tracking-wider text-[#3b71ca] hover:bg-[#3b71ca] hover:text-white" type="button" onClick={onLogout}><NavIcon name="out" />Sign out</button>
+        </div>
       </aside>
       <main className="min-w-0 px-5 py-6 md:px-8 md:py-8">{children}</main>
     </div>
@@ -476,17 +590,18 @@ function DeskShell({ me, onLogout, nav, note, children }) {
 }
 
 function NavLabel({ children }) {
-  return <p className="px-3 pb-1 pt-4 text-[10px] font-medium tracking-[0.18em] text-stone-500 first:pt-0">{children}</p>;
+  return <p className="px-3 pb-1 pt-4 text-[10px] font-medium uppercase tracking-[0.16em] text-[#9e9e9e] first:pt-0">{children}</p>;
 }
 
-function NavButton({ active, onClick, children }) {
+function NavButton({ active, onClick, icon, children }) {
   return (
     <button
-      className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm ${active ? "bg-white text-stone-950" : "text-stone-200 hover:bg-white/10"}`}
+      className={`flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm transition ${active ? "bg-[#3b71ca]/10 font-medium text-[#3b71ca]" : "text-[#4f4f4f] hover:bg-black/[0.04]"}`}
       type="button"
       onClick={onClick}
     >
-      {children}
+      <NavIcon name={icon} />
+      <span className="flex min-w-0 flex-1 items-center justify-between gap-2">{children}</span>
     </button>
   );
 }
@@ -511,7 +626,7 @@ function Toaster({ toasts, onDismiss }) {
         <button
           key={toast.id}
           type="button"
-          className={`pointer-events-auto rounded-2xl px-4 py-3 text-left text-sm text-white shadow-lg ${toast.tone === "error" ? "bg-red-700" : "bg-stone-950"}`}
+          className={`pointer-events-auto rounded px-4 py-3 text-left text-sm text-white shadow-[0_2px_15px_-3px_rgba(0,0,0,0.2)] ${toast.tone === "error" ? "bg-[#dc4c64]" : "bg-[#3b71ca]"}`}
           onClick={() => onDismiss(toast.id)}
         >
           <strong className="block">{toast.title}</strong>
@@ -536,14 +651,16 @@ export function SystemAdmin({ me, onLogout }) {
   const nav = (
     <>
       <NavLabel>Staff</NavLabel>
-      <NavButton active={page === "staff"} onClick={() => setPage("staff")}>Create staff</NavButton>
-      <NavButton active={page === "roles"} onClick={() => setPage("roles")}>Roles</NavButton>
+      <NavButton icon="staff" active={page === "staff"} onClick={() => setPage("staff")}>Create staff</NavButton>
+      <NavButton icon="roles" active={page === "roles"} onClick={() => setPage("roles")}>Roles</NavButton>
       <NavLabel>Candidates</NavLabel>
-      <NavButton active={page === "upload"} onClick={() => setPage("upload")}>Upload emails</NavButton>
-      <NavButton active={page === "emails"} onClick={() => setPage("emails")}>Uploaded emails</NavButton>
+      <NavButton icon="upload" active={page === "upload"} onClick={() => setPage("upload")}>Upload emails</NavButton>
+      <NavButton icon="inbox" active={page === "emails"} onClick={() => setPage("emails")}>Uploaded emails</NavButton>
       <NavLabel>Desk</NavLabel>
-      <NavButton active={page === "addresses"} onClick={() => setPage("addresses")}>Places</NavButton>
-      <NavButton active={page === "mail"} onClick={() => setPage("mail")}>Outbox</NavButton>
+      <NavButton icon="pin" active={page === "addresses"} onClick={() => setPage("addresses")}>Places</NavButton>
+      <NavButton icon="mail" active={page === "mail"} onClick={() => setPage("mail")}>Outbox</NavButton>
+      <NavButton icon="audit" active={page === "audit"} onClick={() => setPage("audit")}>Audit</NavButton>
+      <NavButton icon="help" active={page === "help"} onClick={() => setPage("help")}>Help</NavButton>
     </>
   );
 
@@ -560,6 +677,8 @@ export function SystemAdmin({ me, onLogout }) {
       {page === "emails" && <EmailListPage />}
       {page === "addresses" && <AddressPage push={toasts.push} />}
       {page === "mail" && <MailPage />}
+      {page === "audit" && <AuditPage />}
+      {page === "help" && <HelpGuide role="systemadmin" />}
       <Toaster toasts={toasts.toasts} onDismiss={toasts.dismiss} />
     </DeskShell>
   );
@@ -872,6 +991,73 @@ function AddressPage({ push }) {
       </div>
     </>
   );
+}
+
+export function AuditPage() {
+  return (
+    <>
+      <header className="mb-6">
+        <h1 className="font-serif text-4xl">Audit</h1>
+        <p className="mt-1 max-w-2xl text-stone-500">Sign-ins, role changes, invitation sheets, exam uploads, assignments, and papers are kept here. Search a name, an email, or an action.</p>
+      </header>
+      <AuditTable />
+    </>
+  );
+}
+
+function AuditTable() {
+  const hostRef = useRef(null);
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return undefined;
+    const table = document.createElement("table");
+    table.className = "display";
+    table.style.width = "100%";
+    table.innerHTML = "<thead><tr><th>When</th><th>Who</th><th>Action</th><th>What happened</th></tr></thead>";
+    host.appendChild(table);
+    let dt;
+    let cancelled = false;
+    const frame = requestAnimationFrame(() => {
+      if (cancelled) return;
+      dt = new DataTable(table, {
+        serverSide: true,
+        processing: false,
+        autoWidth: false,
+        pageLength: 8,
+        order: [[0, "desc"]],
+        ajax: { url: "/api/audit" },
+        columns: [
+          { data: "at", title: "When", render: (value) => value ? new Date(value).toLocaleString() : "" },
+          {
+            data: "actorName",
+            title: "Who",
+            render: (value, type, row) => {
+              const who = value || "Unknown";
+              if (type !== "display") return `${who} ${row.actorEmail || ""}`;
+              return `<span class="block">${pill(who, "stone")}</span>${row.actorEmail ? `<span class="mt-1 block text-xs text-stone-500">${pill(row.actorEmail, "stone")}</span>` : ""}`;
+            }
+          },
+          { data: "action", title: "Action", render: (value, type) => type !== "display" ? value : pill(value || "Note", auditTone(value)) },
+          { data: "detail", title: "What happened" }
+        ],
+        language: { emptyTable: "No audit entries yet.", zeroRecords: "No matches.", search: "Search:", lengthMenu: "Show _MENU_", info: "Showing _START_ to _END_ of _TOTAL_" }
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+      try { dt?.destroy(); } catch { /* The page already left. */ }
+      host.replaceChildren();
+    };
+  }, []);
+  return <div ref={hostRef} className="rounded-3xl bg-white p-4 shadow-sm" />;
+}
+
+function auditTone(action) {
+  if (action === "Sign-in failed" || action === "Sign-in refused" || action === "Paper closed" || action === "Section A failed") return "red";
+  if (action === "Role changed" || action === "Account switched" || action === "Exam assigned" || action === "Invigilator assigned" || action === "Written saved") return "amber";
+  if (action === "Signed out" || action === "Paper started") return "stone";
+  return "emerald";
 }
 
 function MailPage() {

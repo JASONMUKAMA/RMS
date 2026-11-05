@@ -96,7 +96,6 @@ public static class ExamLog
         command.Parameters.Add(Sql.Param("$at", DateTimeOffset.UtcNow.ToString("O")));
         command.Parameters.Add(Sql.Param("$warnings", warnings));
         await command.ExecuteNonQueryAsync();
-        await Mailbox.SendResult(db, sittingId);
     }
 
     public static async Task<int> WarningCount(AppDb db, int sittingId)

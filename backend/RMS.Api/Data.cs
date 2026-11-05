@@ -55,6 +55,7 @@ public sealed class Question
     public string OptionsJson { get; set; } = "[]";
     public string Answer { get; set; } = "";
     public int Marks { get; set; } = 1;
+    public string Section { get; set; } = "A";
 }
 
 public sealed class Sitting
@@ -69,6 +70,11 @@ public sealed class Sitting
     public string Status { get; set; } = SittingStatus.InProgress;
     public int Score { get; set; }
     public int MaxScore { get; set; }
+    public string Stage { get; set; } = "A";
+    public int SectionAScore { get; set; }
+    public int SectionAMax { get; set; }
+    public int SectionBScore { get; set; }
+    public int SectionBMax { get; set; }
     public List<Answer> Answers { get; set; } = [];
 }
 

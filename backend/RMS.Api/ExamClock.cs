@@ -66,4 +66,35 @@ public static class SittingStatus
     public const string InProgress = "in_progress";
     public const string Submitted = "submitted";
     public const string Expired = "expired";
+    public const string Failed = "failed";
+    public const string Awaiting = "awaiting";
+    public const string Marked = "marked";
+}
+
+public static class PaperGate
+{
+    public static void SaveWritten(Sitting sitting, DateTimeOffset now)
+    {
+        sitting.Status = SittingStatus.Awaiting;
+        sitting.SubmittedAt = now;
+        sitting.Score = sitting.SectionAScore;
+        var max = sitting.SectionAMax + sitting.SectionBMax;
+        if (max > 0)
+            sitting.MaxScore = max;
+    }
+
+    public static bool TimeUp(Sitting sitting, DateTimeOffset now)
+    {
+        if (sitting.Status != SittingStatus.InProgress || now < sitting.EndsAt)
+            return false;
+        if (sitting.Stage == "B")
+        {
+            SaveWritten(sitting, now);
+            return true;
+        }
+
+        if (sitting.SectionAMax == 0 && sitting.Assessment is not null)
+            sitting.SectionAMax = sitting.Assessment.Questions.Where(question => !Marking.IsWritten(question)).Sum(question => question.Marks);
+        return ExamClock.TryExpire(sitting, now);
+    }
 }

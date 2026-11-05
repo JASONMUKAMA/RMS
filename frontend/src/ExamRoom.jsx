@@ -3,6 +3,7 @@ import { HubConnectionBuilder } from "@microsoft/signalr";
 import { api } from "./api";
 import { openPublisher } from "./liveDesk";
 import { loadWatchers, readPosture } from "./watchPose";
+import { HelpGuide } from "./People";
 
 const WARM_SECONDS = 20 * 60;
 const HEAVY_SECONDS = 5 * 60;
@@ -128,6 +129,8 @@ export default function ExamRoom({ sittingId, onLeave }) {
   const [lookAway, setLookAway] = useState(false);
   const lookAwayRef = useRef(false);
   const [leaveAsk, setLeaveAsk] = useState(false);
+  const [help, setHelp] = useState(false);
+  const [confirm, setConfirm] = useState(null);
   const [opened, setOpened] = useState(false);
   const awayRef = useRef(false);
   const heard = useRef("running");
@@ -385,7 +388,7 @@ export default function ExamRoom({ sittingId, onLeave }) {
   }, [lookAway, sittingId, sync?.status]);
 
   useEffect(() => {
-    if (sync?.status !== "submitted" && sync?.status !== "expired") return undefined;
+    if (!["submitted", "expired", "failed", "awaiting", "marked"].includes(sync?.status)) return undefined;
     api(`/api/sittings/${sittingId}/summary`, { method: "POST" }).catch(() => {});
   }, [sync?.status, sittingId]);
 
@@ -508,7 +511,22 @@ export default function ExamRoom({ sittingId, onLeave }) {
     setSync({ ...body, receivedAt: Date.now() });
   }
 
+  async function askSubmit() {
+    try {
+      for (const question of sync.questions) {
+        await api(`/api/sittings/${sittingId}/answers`, {
+          method: "PUT",
+          body: JSON.stringify({ questionId: question.id, response: question.response || "" })
+        });
+      }
+      setConfirm(await api(`/api/sittings/${sittingId}/preview`));
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   async function submit() {
+    setConfirm(null);
     try {
       const body = await api(`/api/sittings/${sittingId}/submit`, { method: "POST" });
       setSync({ ...body, receivedAt: Date.now() });
@@ -529,14 +547,31 @@ export default function ExamRoom({ sittingId, onLeave }) {
 
   if (!sync) return <p className="grid min-h-screen place-items-center text-stone-500">Opening the paper…</p>;
 
-  if (sync.status === "expired" || sync.status === "submitted") {
-    const expired = sync.status === "expired";
+  if (["expired", "submitted", "failed", "awaiting", "marked"].includes(sync.status)) {
+    const heading = sync.status === "expired" ? "No marks"
+      : sync.status === "failed" ? `${sync.sectionAScore} / ${sync.sectionAMax}`
+      : sync.status === "awaiting" ? `${sync.sectionAScore} / ${sync.sectionAMax}`
+      : `${sync.score} / ${sync.maxScore}`;
+    const kicker = sync.status === "expired" ? "Time is up"
+      : sync.status === "failed" ? "Fail"
+      : sync.status === "awaiting" ? "Written answers saved"
+      : sync.status === "marked" ? "Marked"
+      : "Pass";
+    const detail = sync.status === "expired"
+      ? `The clock ended during Section A, so that section scores 0 of ${sync.sectionAMax}. The written paper stays closed.`
+      : sync.status === "failed"
+        ? `${sync.percent}% of Section A. The written paper opens at ${sync.neededPercent}%. Section B stays closed.`
+        : sync.status === "awaiting"
+          ? `${sync.percent}% opened Section B. The written answers are saved. An examiner will award those marks.`
+          : sync.status === "marked"
+            ? `Section A ${sync.sectionAScore} of ${sync.sectionAMax}. Section B ${sync.sectionBScore} of ${sync.sectionBMax}.`
+            : `${sync.percent}% of Section A. This paper has no written section.`;
     return (
-      <section className="grid min-h-screen place-items-center bg-stone-100 px-6">
+      <section className="grid min-h-screen place-items-center bg-[#fbfbfb] px-6">
         <div className="max-w-lg rounded-3xl bg-white p-8 shadow-xl">
-          <p className="text-sm text-stone-500">{expired ? "Time is up" : "Submitted in time"}</p>
-          <h1 className="mt-2 font-serif text-5xl">{expired ? "No marks" : `${sync.score} / ${sync.maxScore}`}</h1>
-          <p className="mt-3 text-stone-600">{expired ? "The clock ended before this paper was submitted, so the score is 0." : "These marks stand because the paper was submitted before the clock ended."}</p>
+          <p className="text-sm text-stone-500">{kicker}</p>
+          <h1 className="mt-2 font-serif text-5xl">{heading}</h1>
+          <p className="mt-3 text-stone-600">{detail} The marks are in the email to you.</p>
           <button className="mt-6 rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50" type="button" onClick={onLeave}>Back to papers</button>
         </div>
       </section>
@@ -558,12 +593,16 @@ export default function ExamRoom({ sittingId, onLeave }) {
   const questionsOpen = camera === "live" || camera === "without";
 
   return (
-    <main className="min-h-screen bg-stone-100 text-stone-900">
-      <div className="sticky top-0 z-20 flex flex-wrap items-center justify-between gap-4 border-b border-stone-200 bg-white/95 px-5 py-4 backdrop-blur">
+    <main className="min-h-screen bg-[#fbfbfb] text-stone-900">
+      <div className="sticky top-0 z-20 flex flex-wrap items-center justify-between gap-4 border-b border-black/5 border-t-4 border-t-[#3b71ca] bg-white px-5 py-4 shadow-[0_2px_15px_-3px_rgba(0,0,0,0.07)]">
         <div>
-          <button className="rounded-full border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-800 shadow-sm hover:bg-stone-50" type="button" onClick={() => setLeaveAsk(true)}>Leave exam</button>
+          <div className="flex flex-wrap gap-2">
+            <button className="rounded-full border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-800 shadow-sm hover:bg-stone-50" type="button" onClick={() => setHelp((open) => !open)}>{help ? "Hide help" : "Help"}</button>
+            <button className="rounded-full border border-stone-300 bg-white px-4 py-2 text-sm font-medium text-stone-800 shadow-sm hover:bg-stone-50" type="button" onClick={() => setLeaveAsk(true)}>Leave exam</button>
+          </div>
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <span className="rounded-full bg-stone-200 px-2.5 py-0.5 text-xs font-medium text-stone-800">{sync.title}</span>
+            <span className="rounded-full bg-amber-200 px-2.5 py-0.5 text-xs font-medium text-amber-950">{sync.stage === "B" ? "Section B · Written" : "Section A · Objectives"}</span>
             {hand === "up" && <span className="rounded-full bg-red-600 px-2.5 py-0.5 text-xs font-medium text-white">Hand up</span>}
             {hand === "seen" && <span className="rounded-full bg-emerald-200 px-2.5 py-0.5 text-xs font-medium text-emerald-950">Hand seen</span>}
             {camera === "without" && <span className="rounded-full bg-amber-200 px-2.5 py-0.5 text-xs font-medium text-amber-950">Camera off</span>}
@@ -579,17 +618,27 @@ export default function ExamRoom({ sittingId, onLeave }) {
             disabled={camera !== "live"}
           />
           <button className="rounded-full bg-red-700 px-5 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-red-800 disabled:cursor-not-allowed disabled:opacity-40" type="button" disabled={camera !== "live" || hand === "up"} onClick={() => raiseHand().catch((err) => setError(err.message))}>Raise hand</button>
-          <button className="rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50 shadow-sm transition hover:bg-stone-800" type="button" onClick={submit}>Submit paper</button>
+          <button className="rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50 shadow-sm transition hover:bg-stone-800" type="button" onClick={askSubmit}>{sync.stage === "B" ? "Submit written answers" : "Submit section A"}</button>
         </div>
       </div>
+      {help && (
+        <div className="border-b border-stone-200 bg-[#fbfbfb] px-5 py-6">
+          <HelpGuide role="student" />
+        </div>
+      )}
+      {sync.stage === "B" && (
+        <div className="bg-emerald-50 px-5 py-3 text-emerald-950" role="status">
+          Section A is {sync.sectionAScore} of {sync.sectionAMax} ({sync.percent}%). That is at least 70%, so this written section is open. The system does not mark it.
+        </div>
+      )}
       {phase === "warm" && (
         <div className="bg-amber-100 px-5 py-3 text-amber-950" role="status">
-          <strong>Less than twenty minutes remain.</strong> There is still time. Submit before the clock ends. An unsubmitted paper receives no marks.
+          <strong>Less than twenty minutes remain.</strong> {sync.stage === "B" ? "Submit the written answers before the clock ends. They are saved for the examiner." : "Submit Section A before the clock ends. An unsubmitted Section A scores nothing."}
         </div>
       )}
       {phase === "heavy" && (
         <div className="bg-red-100 px-5 py-3 text-red-900" role="alert">
-          <strong>Less than five minutes remain.</strong> Submit now. When the clock hits zero, this paper closes with no marks.
+          <strong>Less than five minutes remain.</strong> {sync.stage === "B" ? "Submit the written answers now. At zero they are saved for the examiner." : "Submit Section A now. At zero this paper fails and the written section stays closed."}
         </div>
       )}
       {hand === "up" && <div className="bg-red-700 px-5 py-3 text-white" role="status">Your hand is up.</div>}
@@ -689,6 +738,36 @@ export default function ExamRoom({ sittingId, onLeave }) {
             >
               I am back. Continue the exam
             </button>
+          </div>
+        </div>
+      )}
+      {confirm && (
+        <div className="fixed inset-0 z-[80] grid place-items-center bg-black/50 px-6" role="alertdialog" aria-modal="true" aria-labelledby="end-title">
+          <div className="w-full max-w-lg rounded-lg bg-white p-8 shadow-[0_2px_15px_-3px_rgba(0,0,0,0.07),0_10px_20px_-2px_rgba(0,0,0,0.04)]">
+            <p className={`text-xs font-medium tracking-[0.16em] ${confirm.stage === "A" && (!confirm.passed || confirm.unanswered > 0) ? "text-[#dc4c64]" : "text-[#e4a11b]"}`}>
+              {confirm.stage === "B" ? "END THE EXAM" : "END SECTION A"}
+            </p>
+            <h2 id="end-title" className="mt-2 text-3xl font-medium text-[#332d2d]">
+              {confirm.stage === "B" ? "You are about to end this exam" : "You are about to end the objectives"}
+            </h2>
+            {confirm.stage === "B" ? (
+              <>
+                <p className="mt-3 text-[#4f4f4f]">The written answers are saved for an examiner. The system does not mark them, and you cannot change them after this.</p>
+                {confirm.unanswered > 0 && <p className="mt-3 font-medium text-[#dc4c64]">{confirm.unanswered} of {confirm.questionCount} written questions have no answer. An empty answer can only be awarded 0.</p>}
+              </>
+            ) : (
+              <>
+                <p className="mt-3 text-[#4f4f4f]">This ends Section A. You cannot change these answers afterwards.</p>
+                {confirm.unanswered > 0 && <p className="mt-3 font-medium text-[#dc4c64]">{confirm.unanswered} of {confirm.questionCount} objectives have no answer. A blank scores 0.</p>}
+                {!confirm.passed && <p className="mt-3 font-medium text-[#dc4c64]">The answers saved so far are {confirm.sectionAScore} of {confirm.sectionAMax} ({confirm.percent}%). That is below 70%, so the result is Fail and the written paper stays closed.</p>}
+                {confirm.passed && confirm.unanswered === 0 && <p className="mt-3 text-[#4f4f4f]">Every objective has an answer, and these answers reach 70%. Ending Section A opens the written paper.</p>}
+                {confirm.passed && confirm.unanswered > 0 && <p className="mt-3 text-[#4f4f4f]">The answered ones are {confirm.sectionAScore} of {confirm.sectionAMax} ({confirm.percent}%), which still reaches 70%. A blank you fill could change that.</p>}
+              </>
+            )}
+            <div className="mt-6 flex flex-wrap gap-2">
+              <button className="rounded bg-[#3b71ca] px-5 py-2.5 text-xs font-medium uppercase tracking-wider text-white" type="button" onClick={() => setConfirm(null)}>Go back</button>
+              <button className="rounded border-2 border-[#dc4c64] px-5 py-2.5 text-xs font-medium uppercase tracking-wider text-[#dc4c64] hover:bg-[#dc4c64] hover:text-white" type="button" onClick={submit}>{confirm.stage === "B" ? "End the exam" : "End Section A"}</button>
+            </div>
           </div>
         </div>
       )}

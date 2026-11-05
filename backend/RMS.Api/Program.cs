@@ -60,6 +60,8 @@ app.UseStaticFiles(new StaticFileOptions
         var path = context.Context.Request.Path;
         if (path.StartsWithSegments("/assets") || path.StartsWithSegments("/mediapipe") || path.StartsWithSegments("/models"))
             context.Context.Response.Headers.CacheControl = "public,max-age=31536000,immutable";
+        else
+            context.Context.Response.Headers.CacheControl = "no-cache";
     }
 });
 app.UseCors();
@@ -131,16 +133,25 @@ app.MapPost("/api/login", async (LoginRequest body, AppDb db, HttpContext http) 
     var email = body.Email.Trim().ToLowerInvariant();
     var user = await db.Users.FirstOrDefaultAsync(u => u.Email == email);
     if (user is null || !Passwords.Verify(body.Password, user.PasswordHash))
+    {
+        await Audit.Note(db, null, "", email, "Sign-in failed", user is null ? "No account uses that email." : "The password did not match.");
         return Results.Json(new { error = "Those sign-in details do not match." }, statusCode: StatusCodes.Status401Unauthorized);
+    }
     if (!user.Active)
+    {
+        await Audit.Note(db, user.Id, user.FullName, user.Email, "Sign-in refused", "The account is switched off.");
         return Results.Json(new { error = "This account is switched off. Ask the system admin." }, statusCode: StatusCodes.Status403Forbidden);
+    }
 
     await Sessions.SignIn(http, user);
+    await Audit.Note(db, user.Id, user.FullName, user.Email, "Signed in", $"{user.FullName} signed in as {Audit.RoleName(user.Role)}.");
     return Results.Ok(UserView.From(user));
 });
 
-app.MapPost("/api/logout", async (HttpContext http) =>
+app.MapPost("/api/logout", async (ClaimsPrincipal user, HttpContext http, AppDb db) =>
 {
+    if (user.Identity?.IsAuthenticated == true)
+        await Audit.Note(db, user, "Signed out", "The session ended.");
     await http.SignOutAsync();
     return Results.NoContent();
 });
@@ -198,9 +209,10 @@ app.MapPost("/api/assessments/file", async (HttpRequest request, ClaimsPrincipal
     var title = form["title"].ToString();
     var duration = int.TryParse(form["durationMinutes"], out var minutes) ? minutes : 0;
     var file = form.Files.GetFile("file");
+    var key = form.Files.GetFile("key");
     if (file is null || file.Length == 0)
         return Results.BadRequest(new { error = "Choose an Excel or Word file." });
-    if (file.Length > 5_000_000)
+    if (file.Length > 5_000_000 || key is { Length: > 5_000_000 })
         return Results.BadRequest(new { error = "The file is larger than 5 MB." });
 
     var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
@@ -208,13 +220,27 @@ app.MapPost("/api/assessments/file", async (HttpRequest request, ClaimsPrincipal
     try
     {
         await using var stream = file.OpenReadStream();
-        questions = extension switch
+        Stream? keyStream = null;
+        try
         {
-            ".xlsx" => AssessmentFactory.ReadExcel(stream),
-            ".docx" => AssessmentFactory.ReadWord(stream),
-            ".csv" => AssessmentFactory.ReadCsv(stream),
-            _ => throw new InvalidDataException("Upload an Excel workbook (.xlsx) or a Word document (.docx).")
-        };
+            if (key is not null)
+            {
+                if (!key.FileName.EndsWith(".docx", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("The answer sheet needs to be a Word document (.docx).");
+                keyStream = key.OpenReadStream();
+            }
+            questions = extension switch
+            {
+                ".xlsx" => AssessmentFactory.ReadExcel(stream),
+                ".docx" => AssessmentFactory.ReadWord(stream, keyStream),
+                ".csv" => AssessmentFactory.ReadCsv(stream),
+                _ => throw new InvalidDataException("Upload an Excel workbook (.xlsx) or a Word document (.docx).")
+            };
+        }
+        finally
+        {
+            keyStream?.Dispose();
+        }
     }
     catch (InvalidDataException ex)
     {
@@ -235,6 +261,7 @@ app.MapPost("/api/assessments/file", async (HttpRequest request, ClaimsPrincipal
     };
     db.Assessments.Add(paper);
     await db.SaveChangesAsync();
+    await Audit.Note(db, user, "Exam uploaded", $"{paper.Title} was uploaded from {file.FileName}. {questions.Count} questions, {paper.DurationMinutes} minutes.");
     return Results.Ok(AssessmentView.From(paper, includeKey: true, sitting: null));
 }).RequireAuthorization().DisableAntiforgery();
 
@@ -249,6 +276,7 @@ app.MapPost("/api/assessments", async (AssessmentWrite body, ClaimsPrincipal use
 
     db.Assessments.Add(parsed.Assessment!);
     await db.SaveChangesAsync();
+    await Audit.Note(db, user, "Exam written", $"{parsed.Assessment!.Title} was written on the desk. {parsed.Assessment.Questions.Count} questions, {parsed.Assessment.DurationMinutes} minutes.");
     return Results.Ok(AssessmentView.From(parsed.Assessment!, includeKey: true));
 }).RequireAuthorization();
 
@@ -269,8 +297,7 @@ app.MapPost("/api/sittings", async (StartSitting body, ClaimsPrincipal user, App
     if (existing is not null)
     {
         var nowExisting = DateTimeOffset.UtcNow;
-        if (ExamClock.TryExpire(existing, nowExisting))
-            await db.SaveChangesAsync();
+        await ExamClose.IfDue(existing, nowExisting, db, null, user);
         return Results.Ok(await SittingView.Build(db, existing, nowExisting));
     }
 
@@ -279,6 +306,8 @@ app.MapPost("/api/sittings", async (StartSitting body, ClaimsPrincipal user, App
         return Results.BadRequest(new { error = "This exam is not assigned to you." });
 
     var now = DateTimeOffset.UtcNow;
+    var objectives = assessment.Questions.Where(question => !Marking.IsWritten(question)).ToList();
+    var written = assessment.Questions.Where(Marking.IsWritten).ToList();
     var sitting = new Sitting
     {
         AssessmentId = assessment.Id,
@@ -286,11 +315,15 @@ app.MapPost("/api/sittings", async (StartSitting body, ClaimsPrincipal user, App
         StartedAt = now,
         EndsAt = now.AddMinutes(assessment.DurationMinutes),
         Status = SittingStatus.InProgress,
+        Stage = objectives.Count > 0 ? "A" : "B",
+        SectionAMax = objectives.Sum(question => question.Marks),
+        SectionBMax = written.Sum(question => question.Marks),
         MaxScore = assessment.Questions.Sum(q => q.Marks)
     };
     db.Sittings.Add(sitting);
     await db.SaveChangesAsync();
     sitting.Assessment = assessment;
+    await Audit.Note(db, user, "Paper started", $"{user.FindFirstValue(ClaimTypes.Name)} started {assessment.Title}.");
     return Results.Ok(await SittingView.Build(db, sitting, now));
 }).RequireAuthorization();
 
@@ -314,7 +347,13 @@ app.MapGet("/api/sittings", async (ClaimsPrincipal user, AppDb db, HttpRequest r
         from sitting in db.Sittings.AsNoTracking()
         join student in db.Users.AsNoTracking() on sitting.StudentId equals student.Id
         join paper in db.Assessments.AsNoTracking() on sitting.AssessmentId equals paper.Id
-        where sitting.Status == status
+        where status == SittingStatus.Submitted
+            ? sitting.Status == SittingStatus.Submitted
+                || sitting.Status == SittingStatus.Failed
+                || sitting.Status == SittingStatus.Awaiting
+                || sitting.Status == SittingStatus.Marked
+                || sitting.Status == SittingStatus.Expired
+            : sitting.Status == SittingStatus.InProgress
         select new { sitting, student, paper };
 
     var recordsTotal = await query.CountAsync();
@@ -342,7 +381,12 @@ app.MapGet("/api/sittings", async (ClaimsPrincipal user, AppDb db, HttpRequest r
     var recordsFiltered = await query.CountAsync();
     var pageRows = await query.Skip(start).Take(length).ToListAsync();
     var undertakingTotal = await db.Sittings.CountAsync(s => s.Status == SittingStatus.InProgress);
-    var submittedTotal = await db.Sittings.CountAsync(s => s.Status == SittingStatus.Submitted);
+    var submittedTotal = await db.Sittings.CountAsync(s =>
+        s.Status == SittingStatus.Submitted
+        || s.Status == SittingStatus.Failed
+        || s.Status == SittingStatus.Awaiting
+        || s.Status == SittingStatus.Marked
+        || s.Status == SittingStatus.Expired);
     var now = DateTimeOffset.UtcNow;
 
     return Results.Ok(new
@@ -363,8 +407,11 @@ app.MapGet("/api/sittings", async (ClaimsPrincipal user, AppDb db, HttpRequest r
                 studentName = row.student.FullName,
                 email = row.student.Email,
                 paper = row.paper.Title,
+                status = row.sitting.Status,
                 score = row.sitting.Status == SittingStatus.InProgress ? (int?)null : row.sitting.Score,
                 maxScore = row.sitting.MaxScore,
+                sectionAScore = row.sitting.SectionAScore,
+                sectionAMax = row.sitting.SectionAMax,
                 remainingSeconds = row.sitting.Status == SittingStatus.InProgress ? (int)Math.Ceiling(remaining.TotalSeconds) : 0
             };
         })
@@ -380,16 +427,11 @@ app.MapGet("/api/sittings/{id:int}", async (int id, ClaimsPrincipal user, AppDb 
         return Results.Forbid();
 
     var now = DateTimeOffset.UtcNow;
-    if (ExamClock.TryExpire(sitting, now))
-    {
-        await db.SaveChangesAsync();
-        await NotifyExpired(hub, sitting);
-    }
-
+    await ExamClose.IfDue(sitting, now, db, hub, user);
     return Results.Ok(await SittingView.Build(db, sitting, now));
 }).RequireAuthorization();
 
-app.MapPut("/api/sittings/{id:int}/answers", async (int id, SaveAnswer body, ClaimsPrincipal user, AppDb db, AnswerSimilarity similarity) =>
+app.MapPut("/api/sittings/{id:int}/answers", async (int id, SaveAnswer body, ClaimsPrincipal user, AppDb db, IHubContext<DeskHub> hub, AnswerSimilarity similarity) =>
 {
     var sitting = await LoadSitting(db, id);
     if (sitting is null)
@@ -398,15 +440,18 @@ app.MapPut("/api/sittings/{id:int}/answers", async (int id, SaveAnswer body, Cla
         return Results.Forbid();
 
     var now = DateTimeOffset.UtcNow;
-    if (ExamClock.TryExpire(sitting, now))
-    {
-        await db.SaveChangesAsync();
-        return Results.Json(new { error = "Time is up. This paper was not submitted, so it receives no marks.", score = 0 }, statusCode: StatusCodes.Status409Conflict);
-    }
+    if (await ExamClose.IfDue(sitting, now, db, hub, user))
+        return sitting.Status == SittingStatus.Expired
+            ? Results.Json(new { error = "Time is up. Section A was not submitted, so it receives no marks.", score = 0, status = sitting.Status }, statusCode: StatusCodes.Status409Conflict)
+            : Results.Ok(await SittingView.Build(db, sitting, now));
 
     var question = sitting.Assessment!.Questions.FirstOrDefault(q => q.Id == body.QuestionId);
     if (question is null)
         return Results.BadRequest(new { error = "That question is not on this paper." });
+    if (sitting.Stage == "A" && Marking.IsWritten(question))
+        return Results.BadRequest(new { error = "Section B opens after Section A reaches 70%." });
+    if (sitting.Stage == "B" && !Marking.IsWritten(question))
+        return Results.BadRequest(new { error = "Section A is already marked." });
 
     var answer = sitting.Answers.FirstOrDefault(a => a.QuestionId == question.Id);
     if (answer is null)
@@ -421,6 +466,33 @@ app.MapPut("/api/sittings/{id:int}/answers", async (int id, SaveAnswer body, Cla
     return Results.Ok(await SittingView.Build(db, sitting, now));
 }).RequireAuthorization();
 
+app.MapGet("/api/sittings/{id:int}/preview", async (int id, ClaimsPrincipal user, AppDb db) =>
+{
+    var sitting = await LoadSitting(db, id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (!IsOwner(user, sitting))
+        return Results.Forbid();
+    if (sitting.Status != SittingStatus.InProgress)
+        return Results.BadRequest(new { error = "This paper is already closed." });
+
+    var written = sitting.Stage == "B";
+    var questions = sitting.Assessment!.Questions.Where(question => Marking.IsWritten(question) == written).ToList();
+    var unanswered = questions.Count(question => string.IsNullOrWhiteSpace(sitting.Answers.FirstOrDefault(answer => answer.QuestionId == question.Id)?.Response));
+    var (score, max) = written ? (sitting.SectionAScore, sitting.SectionAMax) : Marking.Preview(sitting);
+    var percent = Marking.Percent(score, max);
+    return Results.Ok(new
+    {
+        stage = string.IsNullOrWhiteSpace(sitting.Stage) ? "A" : sitting.Stage,
+        unanswered,
+        questionCount = questions.Count,
+        sectionAScore = score,
+        sectionAMax = max,
+        percent,
+        passed = written || Marking.Passed(score, max)
+    });
+}).RequireAuthorization();
+
 app.MapPost("/api/sittings/{id:int}/submit", async (int id, ClaimsPrincipal user, AppDb db, IHubContext<DeskHub> hub) =>
 {
     var sitting = await LoadSitting(db, id);
@@ -430,18 +502,60 @@ app.MapPost("/api/sittings/{id:int}/submit", async (int id, ClaimsPrincipal user
         return Results.Forbid();
 
     var now = DateTimeOffset.UtcNow;
-    var graded = Marking.Score(sitting);
-    if (!ExamClock.TrySubmit(sitting, now, graded))
+    if (sitting.Status != SittingStatus.InProgress)
+        return Results.BadRequest(new { error = "This paper is already closed." });
+    if (await ExamClose.IfDue(sitting, now, db, hub, user))
+        return sitting.Status == SittingStatus.Expired
+            ? Results.Json(new { error = "Time is up. Section A was not submitted, so it receives no marks.", score = 0, status = sitting.Status }, statusCode: StatusCodes.Status409Conflict)
+            : Results.Ok(await SittingView.Build(db, sitting, now));
+
+    var title = sitting.Assessment?.Title ?? "The paper";
+    if (sitting.Stage == "B")
     {
+        PaperGate.SaveWritten(sitting, now);
         await db.SaveChangesAsync();
-        await NotifyExpired(hub, sitting);
         await ExamLog.Seal(db, sitting.Id);
-        return Results.Json(new { error = "Time is up. This paper was not submitted, so it receives no marks.", score = 0, status = sitting.Status }, statusCode: StatusCodes.Status409Conflict);
+        await Audit.Note(db, user, "Written saved", $"{title} Section B was submitted. The answers are saved for marking.");
+        return Results.Ok(await SittingView.Build(db, sitting, now));
     }
 
-    await db.SaveChangesAsync();
-    if (sitting.Status is SittingStatus.Submitted or SittingStatus.Expired)
+    var (score, max) = Marking.SectionA(sitting);
+    var written = sitting.Assessment!.Questions.Where(Marking.IsWritten).ToList();
+    sitting.SectionAScore = score;
+    sitting.SectionAMax = max;
+    sitting.SectionBMax = written.Sum(question => question.Marks);
+    sitting.SubmittedAt = now;
+
+    if (!Marking.Passed(score, max))
+    {
+        sitting.Status = SittingStatus.Failed;
+        sitting.Score = score;
+        sitting.MaxScore = max;
+        await db.SaveChangesAsync();
+        await Mailbox.SendGate(db, sitting.Id);
         await ExamLog.Seal(db, sitting.Id);
+        await Audit.Note(db, user, "Section A failed", $"{title} Section A scored {score} of {max}. The written paper stays closed.");
+        return Results.Ok(await SittingView.Build(db, sitting, now));
+    }
+
+    if (written.Count == 0)
+    {
+        sitting.Status = SittingStatus.Submitted;
+        sitting.Score = score;
+        sitting.MaxScore = max;
+        await db.SaveChangesAsync();
+        await Mailbox.SendGate(db, sitting.Id);
+        await ExamLog.Seal(db, sitting.Id);
+        await Audit.Note(db, user, "Section A passed", $"{title} Section A scored {score} of {max}. There is no written section.");
+        return Results.Ok(await SittingView.Build(db, sitting, now));
+    }
+
+    sitting.Stage = "B";
+    sitting.Score = score;
+    sitting.MaxScore = max + sitting.SectionBMax;
+    await db.SaveChangesAsync();
+    await Mailbox.SendGate(db, sitting.Id);
+    await Audit.Note(db, user, "Section A passed", $"{title} Section A scored {score} of {max}. Section B is open.");
     return Results.Ok(await SittingView.Build(db, sitting, now));
 }).RequireAuthorization();
 
@@ -454,14 +568,90 @@ app.MapPost("/api/sittings/{id:int}/expire", async (int id, ClaimsPrincipal user
         return Results.Forbid();
 
     var now = DateTimeOffset.UtcNow;
-    ExamClock.TryExpire(sitting, now);
-    await db.SaveChangesAsync();
-    if (sitting.Status == SittingStatus.Expired)
-    {
-        await NotifyExpired(hub, sitting);
-        await ExamLog.Seal(db, sitting.Id);
-    }
+    await ExamClose.IfDue(sitting, now, db, hub, user);
     return Results.Ok(await SittingView.Build(db, sitting, now));
+}).RequireAuthorization();
+
+app.MapGet("/api/marking", async (ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) is not ("teacher" or "superadmin"))
+        return Results.Forbid();
+
+    var rows = await (
+        from sitting in db.Sittings.AsNoTracking()
+        join student in db.Users.AsNoTracking() on sitting.StudentId equals student.Id
+        join paper in db.Assessments.AsNoTracking() on sitting.AssessmentId equals paper.Id
+        where sitting.Status == SittingStatus.Awaiting || sitting.Status == SittingStatus.Marked
+        orderby sitting.Status == SittingStatus.Awaiting descending, sitting.SubmittedAt descending
+        select new
+        {
+            id = sitting.Id,
+            studentName = student.FullName,
+            email = student.Email,
+            paper = paper.Title,
+            status = sitting.Status,
+            sectionAScore = sitting.SectionAScore,
+            sectionAMax = sitting.SectionAMax,
+            sectionBScore = sitting.SectionBScore,
+            sectionBMax = sitting.SectionBMax,
+            submittedAt = sitting.SubmittedAt
+        }
+    ).ToListAsync();
+    return Results.Ok(rows);
+}).RequireAuthorization();
+
+app.MapGet("/api/marking/{id:int}", async (int id, ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) is not ("teacher" or "superadmin"))
+        return Results.Forbid();
+    var sitting = await LoadSitting(db, id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (sitting.Status is not (SittingStatus.Awaiting or SittingStatus.Marked))
+        return Results.BadRequest(new { error = "This written paper is not ready to mark." });
+    return Results.Ok(await MarkScript.Build(db, sitting));
+}).RequireAuthorization();
+
+app.MapPost("/api/marking/{id:int}", async (int id, MarkWrite body, ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) is not ("teacher" or "superadmin"))
+        return Results.Forbid();
+    var sitting = await LoadSitting(db, id);
+    if (sitting is null)
+        return Results.NotFound();
+    if (sitting.Status != SittingStatus.Awaiting)
+        return Results.BadRequest(new { error = "These written answers are already marked." });
+
+    var questions = sitting.Assessment!.Questions.Where(Marking.IsWritten).ToList();
+    var awards = body.Awards ?? [];
+    if (questions.Any(question => !awards.Any(award => award.QuestionId == question.Id)))
+        return Results.BadRequest(new { error = "Award a mark for every written question." });
+
+    foreach (var award in awards)
+    {
+        var question = questions.FirstOrDefault(item => item.Id == award.QuestionId);
+        if (question is null)
+            return Results.BadRequest(new { error = "That question is not on the written section." });
+        if (award.Marks < 0 || award.Marks > question.Marks)
+            return Results.BadRequest(new { error = $"Marks for a written question must be from 0 to {question.Marks}." });
+        var answer = sitting.Answers.FirstOrDefault(item => item.QuestionId == question.Id);
+        if (answer is null)
+        {
+            answer = new Answer { SittingId = sitting.Id, QuestionId = question.Id, Response = "" };
+            sitting.Answers.Add(answer);
+        }
+        answer.Awarded = award.Marks;
+    }
+
+    sitting.SectionBScore = questions.Sum(question => sitting.Answers.First(item => item.QuestionId == question.Id).Awarded);
+    sitting.Score = sitting.SectionAScore + sitting.SectionBScore;
+    sitting.MaxScore = sitting.SectionAMax + sitting.SectionBMax;
+    sitting.Status = SittingStatus.Marked;
+    await db.SaveChangesAsync();
+    await Mailbox.SendWritten(db, sitting.Id);
+    var candidate = await db.Users.AsNoTracking().Where(item => item.Id == sitting.StudentId).Select(item => item.FullName).FirstOrDefaultAsync();
+    await Audit.Note(db, user, "Written marked", $"{candidate ?? "The candidate"} on {sitting.Assessment.Title}: Section B {sitting.SectionBScore} of {sitting.SectionBMax}. Total {sitting.Score} of {sitting.MaxScore}.");
+    return Results.Ok(await MarkScript.Build(db, sitting));
 }).RequireAuthorization();
 
 app.MapGet("/api/watch", async (ClaimsPrincipal user, AppDb db) =>
@@ -615,7 +805,7 @@ app.MapPost("/api/sittings/{id:int}/summary", async (int id, ClaimsPrincipal use
         return Results.NotFound();
     if (sitting.StudentId != studentId)
         return Results.Forbid();
-    if (sitting.Status is not (SittingStatus.Submitted or SittingStatus.Expired))
+    if (sitting.Status is not (SittingStatus.Submitted or SittingStatus.Expired or SittingStatus.Failed or SittingStatus.Awaiting or SittingStatus.Marked))
         return Results.BadRequest(new { error = "The summary is uploaded when the paper ends." });
     await ExamLog.Seal(db, id);
     return Results.NoContent();
@@ -862,13 +1052,15 @@ app.MapGet("/api/roster", async (ClaimsPrincipal user, AppDb db) =>
     }
 
     var names = people.ToDictionary(item => item.Id, item => item.FullName);
+    var titles = exams.ToDictionary(exam => exam.Id, exam => exam.Title);
     return Results.Ok(new
     {
         exams,
-        invigilators = people.Where(item => item.Role == "invigilator" && item.Active).Select(item => new { item.Id, item.FullName, item.Email }),
+        invigilators = people.Where(CanWatch).Select(item => new { item.Id, item.FullName, item.Email, item.Role }),
         students = people.Where(item => item.Role == "student").Select(item =>
         {
             var watch = assignments.FirstOrDefault(row => row.StudentId == item.Id)?.InvigilatorId;
+            var papers = examIds.TryGetValue(item.Email, out var found) ? found : [];
             return new
             {
                 item.Id,
@@ -876,10 +1068,40 @@ app.MapGet("/api/roster", async (ClaimsPrincipal user, AppDb db) =>
                 item.Email,
                 invigilatorId = watch,
                 invigilatorName = watch is int id && names.TryGetValue(id, out var name) ? name : "",
-                examIds = examIds.TryGetValue(item.Email, out var papers) ? papers : []
+                examIds = papers,
+                exams = string.Join(", ", papers.Where(titles.ContainsKey).Select(id => titles[id]))
             };
         })
     });
+}).RequireAuthorization();
+
+app.MapPost("/api/roster/exam", async (RosterExam body, ClaimsPrincipal user, AppDb db) =>
+{
+    if (user.FindFirstValue(ClaimTypes.Role) != "superadmin")
+        return Results.Forbid();
+
+    var ids = (body.StudentIds ?? []).Distinct().ToList();
+    if (ids.Count == 0)
+        return Results.BadRequest(new { error = "Choose candidates." });
+    var paperTitle = await db.Assessments.AsNoTracking().Where(item => item.Id == body.AssessmentId).Select(item => item.Title).FirstOrDefaultAsync();
+    if (paperTitle is null)
+        return Results.BadRequest(new { error = "Choose an exam." });
+
+    var students = await db.Users.AsNoTracking()
+        .Where(item => ids.Contains(item.Id) && item.Role == "student")
+        .Select(item => item.Email)
+        .ToListAsync();
+    if (students.Count == 0)
+        return Results.BadRequest(new { error = "Choose a candidate." });
+
+    var added = 0;
+    foreach (var email in students)
+    {
+        if (await PeopleEndpoints.GiveExam(db, email, body.AssessmentId))
+            added++;
+    }
+    await Audit.Note(db, user, "Exam assigned", $"{added} candidate(s) were put on {paperTitle}. {students.Count - added} already had it.");
+    return Results.Ok(new { assigned = added, already = students.Count - added });
 }).RequireAuthorization();
 
 app.MapPost("/api/roster/bulk", async (RosterBulk body, ClaimsPrincipal user, AppDb db) =>
@@ -890,7 +1112,7 @@ app.MapPost("/api/roster/bulk", async (RosterBulk body, ClaimsPrincipal user, Ap
     var ids = (body.StudentIds ?? []).Distinct().ToList();
     if (ids.Count == 0)
         return Results.BadRequest(new { error = "Choose candidates." });
-    var watch = await db.Users.FirstOrDefaultAsync(item => item.Id == body.InvigilatorId && item.Role == "invigilator" && item.Active);
+    var watch = await db.Users.FirstOrDefaultAsync(item => item.Id == body.InvigilatorId && item.Active && (item.Role == "invigilator" || item.Role == "teacher" || item.Role == "superadmin"));
     if (watch is null)
         return Results.BadRequest(new { error = "Choose an invigilator." });
 
@@ -907,6 +1129,7 @@ app.MapPost("/api/roster/bulk", async (RosterBulk body, ClaimsPrincipal user, Ap
             row.InvigilatorId = watch.Id;
     }
     await db.SaveChangesAsync();
+    await Audit.Note(db, user, "Invigilator assigned", $"{students.Count} candidate(s) were assigned to {watch.FullName}.");
     return Results.Ok(new { assigned = students.Count });
 }).RequireAuthorization();
 
@@ -927,7 +1150,7 @@ app.MapPost("/api/roster", async (RosterWrite body, ClaimsPrincipal user, AppDb 
     }
     else
     {
-        var watch = await db.Users.FirstOrDefaultAsync(item => item.Id == body.InvigilatorId && item.Role == "invigilator");
+        var watch = await db.Users.FirstOrDefaultAsync(item => item.Id == body.InvigilatorId && item.Active && (item.Role == "invigilator" || item.Role == "teacher" || item.Role == "superadmin"));
         if (watch is null)
             return Results.BadRequest(new { error = "Choose an invigilator." });
         if (existing is null)
@@ -937,9 +1160,14 @@ app.MapPost("/api/roster", async (RosterWrite body, ClaimsPrincipal user, AppDb 
     }
 
     await db.SaveChangesAsync();
+    var watcher = body.InvigilatorId is null
+        ? "no invigilator"
+        : await db.Users.AsNoTracking().Where(item => item.Id == body.InvigilatorId).Select(item => item.FullName).FirstOrDefaultAsync() ?? "an invigilator";
+    await Audit.Note(db, user, "Invigilator assigned", $"{student.FullName} is now with {watcher}.");
     return Results.NoContent();
 }).RequireAuthorization();
 
+Audit.Map(app);
 PeopleEndpoints.Map(app);
 app.MapHub<DeskHub>("/hubs/desk");
 app.MapFallbackToFile("index.html");
@@ -966,6 +1194,9 @@ static async Task<Sitting?> LoadSitting(AppDb db, int id) =>
         .Include(s => s.Answers)
         .Include(s => s.Assessment)!.ThenInclude(a => a!.Questions)
         .FirstOrDefaultAsync(s => s.Id == id);
+
+static bool CanWatch(UserAccount user) =>
+    user.Active && user.Role is "invigilator" or "teacher" or "superadmin";
 
 static bool IsOwner(ClaimsPrincipal user, Sitting sitting) =>
     user.FindFirstValue(ClaimTypes.Role) == "student"
@@ -997,23 +1228,17 @@ static bool CanRead(ClaimsPrincipal user, Sitting sitting)
     return role is "teacher" or "superadmin" or "invigilator" || id == sitting.StudentId;
 }
 
-static Task NotifyExpired(IHubContext<DeskHub> hub, Sitting sitting) =>
-    hub.Clients.Group(DeskHub.Group(sitting.Id)).SendAsync("expired", new
-    {
-        sittingId = sitting.Id,
-        status = sitting.Status,
-        score = sitting.Score,
-        phase = "ended"
-    });
-
 public sealed record LoginRequest(string Email, string Password);
 
 public sealed record RosterWrite(int StudentId, int? InvigilatorId);
 public sealed record RosterBulk(List<int>? StudentIds, int InvigilatorId);
+public sealed record RosterExam(List<int>? StudentIds, int AssessmentId);
 public sealed record StartSitting(int AssessmentId);
 public sealed record SaveAnswer(int QuestionId, string Response);
 public sealed record WarningWrite(string Kind);
 public sealed record QuestionWrite(string Type, string Prompt, List<string>? Options, string Answer, int Marks);
+public sealed record MarkWrite(List<MarkAward>? Awards);
+public sealed record MarkAward(int QuestionId, int Marks);
 public sealed record AssessmentWrite(string Title, int DurationMinutes, string? Csv, List<QuestionWrite>? Questions);
 
 public static partial class AssessmentFactory
@@ -1062,14 +1287,16 @@ public static partial class AssessmentFactory
         if (type == "mcq")
         {
             var options = write.Options ?? [];
-            if (options.Count != 4 || options.Any(string.IsNullOrWhiteSpace))
-                throw new InvalidDataException("A multiple-choice question needs four options.");
+            if (options.Count is < 2 or > 6 || options.Any(string.IsNullOrWhiteSpace))
+                throw new InvalidDataException("A multiple-choice question needs two to six options.");
             var letter = write.Answer.Trim().ToUpperInvariant();
-            if (letter is not ("A" or "B" or "C" or "D"))
+            var choice = letter.Length == 1 ? letter[0] - 'A' : -1;
+            if (choice < 0 || choice >= options.Count)
                 throw new InvalidDataException("The correct option is A, B, C, or D.");
             return new Question
             {
                 Type = type,
+                Section = "A",
                 Prompt = write.Prompt.Trim(),
                 OptionsJson = JsonSerializer.Serialize(options.Select(o => o.Trim()).ToList()),
                 Answer = letter,
@@ -1082,6 +1309,7 @@ public static partial class AssessmentFactory
         return new Question
         {
             Type = type,
+            Section = "B",
             Prompt = write.Prompt.Trim(),
             OptionsJson = "[]",
             Answer = write.Answer.Trim(),
@@ -1144,38 +1372,42 @@ public static partial class AssessmentFactory
 
 public static class Marking
 {
-    public static int Score(Sitting sitting)
+    public const int PassPercent = 70;
+
+    public static bool IsWritten(Question question) =>
+        question.Section == "B" || (string.IsNullOrWhiteSpace(question.Section) && question.Type == "short");
+
+    public static bool Passed(int score, int max) => max <= 0 || score * 100 >= max * PassPercent;
+
+    public static int Percent(int score, int max) => max <= 0 ? 100 : (int)Math.Floor(score * 100.0 / max);
+
+    public static (int Score, int Max) Preview(Sitting sitting)
     {
+        var questions = sitting.Assessment!.Questions.Where(question => !IsWritten(question)).ToList();
         var total = 0;
-        foreach (var question in sitting.Assessment!.Questions)
+        foreach (var question in questions)
         {
-            var answer = sitting.Answers.FirstOrDefault(a => a.QuestionId == question.Id);
-            var awarded = answer is null ? 0 : Award(question, answer.Response);
+            var response = sitting.Answers.FirstOrDefault(answer => answer.QuestionId == question.Id)?.Response?.Trim() ?? "";
+            if (response.Length > 0 && string.Equals(response, question.Answer, StringComparison.OrdinalIgnoreCase))
+                total += question.Marks;
+        }
+        return (total, questions.Sum(question => question.Marks));
+    }
+
+    public static (int Score, int Max) SectionA(Sitting sitting)
+    {
+        var questions = sitting.Assessment!.Questions.Where(question => !IsWritten(question)).ToList();
+        var total = 0;
+        foreach (var question in questions)
+        {
+            var answer = sitting.Answers.FirstOrDefault(item => item.QuestionId == question.Id);
+            var awarded = answer is null ? 0 : string.Equals(answer.Response.Trim(), question.Answer, StringComparison.OrdinalIgnoreCase) ? question.Marks : 0;
             if (answer is not null)
                 answer.Awarded = awarded;
             total += awarded;
         }
-        return total;
+        return (total, questions.Sum(question => question.Marks));
     }
-
-    private static int Award(Question question, string response)
-    {
-        if (question.Type == "mcq")
-            return string.Equals(response.Trim(), question.Answer, StringComparison.OrdinalIgnoreCase) ? question.Marks : 0;
-
-        var left = Words(response);
-        var right = Words(question.Answer);
-        if (left.Count == 0 || right.Count == 0)
-            return 0;
-        var overlap = left.Intersect(right).Count();
-        return overlap >= right.Count * 0.6 ? question.Marks : 0;
-    }
-
-    private static HashSet<string> Words(string value) =>
-        value.ToLowerInvariant()
-            .Split([' ', ',', '.', ';', ':', '?', '!'], StringSplitOptions.RemoveEmptyEntries)
-            .Where(word => word.Length > 3)
-            .ToHashSet();
 }
 
 public static class SittingView
@@ -1189,6 +1421,13 @@ public static class SittingView
             ? ExamClock.Phase(sitting.EndsAt - now)
             : ClockPhase.Ended;
 
+        var stage = string.IsNullOrWhiteSpace(sitting.Stage) ? "A" : sitting.Stage;
+        var questions = sitting.Assessment?.Questions.OrderBy(q => q.Id).ToList() ?? [];
+        if (sitting.Status == SittingStatus.InProgress)
+            questions = questions.Where(question => Marking.IsWritten(question) == (stage == "B")).ToList();
+        else if (sitting.Status is SittingStatus.Failed or SittingStatus.Expired)
+            questions = questions.Where(question => !Marking.IsWritten(question)).ToList();
+
         return Task.FromResult<object>(new
         {
             id = sitting.Id,
@@ -1196,25 +1435,100 @@ public static class SittingView
             title = sitting.Assessment?.Title ?? "",
             durationMinutes = sitting.Assessment?.DurationMinutes ?? 0,
             status = sitting.Status,
+            stage,
             score = sitting.Status == SittingStatus.InProgress ? (int?)null : sitting.Score,
             maxScore = sitting.MaxScore,
+            sectionAScore = sitting.Status == SittingStatus.InProgress && stage == "A" ? (int?)null : sitting.SectionAScore,
+            sectionAMax = sitting.SectionAMax,
+            sectionBScore = sitting.Status == SittingStatus.Marked ? sitting.SectionBScore : (int?)null,
+            sectionBMax = sitting.SectionBMax,
+            percent = Marking.Percent(sitting.SectionAScore, sitting.SectionAMax),
+            passed = Marking.Passed(sitting.SectionAScore, sitting.SectionAMax),
+            neededPercent = Marking.PassPercent,
             startedAt = sitting.StartedAt,
             endsAt = sitting.EndsAt,
             serverNow = now,
             remainingSeconds = (int)Math.Ceiling(remaining.TotalSeconds),
             phase = phase.ToString().ToLowerInvariant(),
-            questions = sitting.Assessment?.Questions
-                .OrderBy(q => q.Id)
-                .Select(q => new
-                {
-                    id = q.Id,
-                    type = q.Type,
-                    prompt = q.Prompt,
-                    options = JsonSerializer.Deserialize<List<string>>(q.OptionsJson) ?? [],
-                    marks = q.Marks,
-                    response = sitting.Answers.FirstOrDefault(a => a.QuestionId == q.Id)?.Response ?? ""
-                })
+            questions = questions.Select(q => new
+            {
+                id = q.Id,
+                type = q.Type,
+                section = Marking.IsWritten(q) ? "B" : "A",
+                prompt = q.Prompt,
+                options = JsonSerializer.Deserialize<List<string>>(q.OptionsJson) ?? [],
+                marks = q.Marks,
+                response = sitting.Answers.FirstOrDefault(a => a.QuestionId == q.Id)?.Response ?? ""
+            })
         });
+    }
+}
+
+public static class MarkScript
+{
+    public static async Task<object> Build(AppDb db, Sitting sitting)
+    {
+        var student = await db.Users.AsNoTracking().FirstOrDefaultAsync(item => item.Id == sitting.StudentId);
+        var questions = (sitting.Assessment?.Questions ?? []).Where(Marking.IsWritten).OrderBy(question => question.Id);
+        return new
+        {
+            id = sitting.Id,
+            studentName = student?.FullName ?? "",
+            email = student?.Email ?? "",
+            paper = sitting.Assessment?.Title ?? "",
+            status = sitting.Status,
+            sectionAScore = sitting.SectionAScore,
+            sectionAMax = sitting.SectionAMax,
+            percent = Marking.Percent(sitting.SectionAScore, sitting.SectionAMax),
+            sectionBScore = sitting.SectionBScore,
+            sectionBMax = sitting.SectionBMax,
+            score = sitting.Score,
+            maxScore = sitting.MaxScore,
+            questions = questions.Select(question => new
+            {
+                id = question.Id,
+                prompt = question.Prompt,
+                model = question.Answer,
+                marks = question.Marks,
+                response = sitting.Answers.FirstOrDefault(answer => answer.QuestionId == question.Id)?.Response ?? "",
+                awarded = sitting.Answers.FirstOrDefault(answer => answer.QuestionId == question.Id)?.Awarded ?? 0
+            })
+        };
+    }
+}
+
+static class ExamClose
+{
+    public static async Task<bool> IfDue(Sitting sitting, DateTimeOffset now, AppDb db, IHubContext<DeskHub>? hub, ClaimsPrincipal? actor)
+    {
+        if (!PaperGate.TimeUp(sitting, now))
+            return false;
+        await db.SaveChangesAsync();
+        if (hub is not null)
+        {
+            await hub.Clients.Group(DeskHub.Group(sitting.Id)).SendAsync("expired", new
+            {
+                sittingId = sitting.Id,
+                status = sitting.Status,
+                score = sitting.Score,
+                phase = "ended"
+            });
+        }
+        await ExamLog.Seal(db, sitting.Id);
+        var title = sitting.Assessment?.Title ?? "The paper";
+        if (sitting.Status == SittingStatus.Expired)
+        {
+            await Mailbox.SendGate(db, sitting.Id);
+            if (actor is not null)
+                await Audit.Note(db, actor, "Paper closed", $"{title} closed because the time was up during Section A. No marks were given.");
+            else
+                await Audit.Note(db, null, "Clock", "", "Paper closed", $"{title} closed because the time was up during Section A. No marks were given.");
+        }
+        else if (actor is not null)
+            await Audit.Note(db, actor, "Written saved", $"{title} closed on Section B. The written answers are saved for marking.");
+        else
+            await Audit.Note(db, null, "Clock", "", "Written saved", $"{title} closed on Section B. The written answers are saved for marking.");
+        return true;
     }
 }
 
@@ -1232,8 +1546,13 @@ public static class AssessmentView
         {
             id = sitting.Id,
             status = sitting.Status,
+            stage = sitting.Stage,
             score = sitting.Status == SittingStatus.InProgress ? (int?)null : sitting.Score,
-            maxScore = sitting.MaxScore
+            maxScore = sitting.MaxScore,
+            sectionAScore = sitting.SectionAScore,
+            sectionAMax = sitting.SectionAMax,
+            sectionBScore = sitting.SectionBScore,
+            sectionBMax = sitting.SectionBMax
         },
         questions = includeKey
             ? assessment.Questions.OrderBy(q => q.Id).Select(q => new

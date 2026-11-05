@@ -235,22 +235,81 @@ public static class Mailbox
         return await Send(db, email, "Your RMS staff account", body, "staff", null);
     }
 
-    public static async Task SendResult(AppDb db, int sittingId)
+    public static async Task SendGate(AppDb db, int sittingId)
     {
         var row = await (
             from sitting in db.Sittings.AsNoTracking()
             join student in db.Users.AsNoTracking() on sitting.StudentId equals student.Id
             join paper in db.Assessments.AsNoTracking() on sitting.AssessmentId equals paper.Id
             where sitting.Id == sittingId
-            select new { student.Email, student.FullName, paper.Title, sitting.Score, sitting.MaxScore, sitting.Status }
+            select new
+            {
+                student.Email,
+                student.FullName,
+                paper.Title,
+                sitting.Status,
+                sitting.SectionAScore,
+                sitting.SectionAMax,
+                sitting.SectionBMax
+            }
         ).FirstOrDefaultAsync();
-        if (row is null || row.Status is not ("submitted" or "expired") || string.IsNullOrWhiteSpace(row.Email))
+        if (row is null || string.IsNullOrWhiteSpace(row.Email))
             return;
-        var outcome = row.Status == "submitted"
-            ? "You submitted in time."
-            : "The clock ran out before you submitted, so the score is 0.";
-        var body = $"Hello {row.FullName},\n\n{row.Title} has closed.\n{outcome}\nScore: {row.Score} of {row.MaxScore}.\n";
-        await Send(db, row.Email, $"Your result for {row.Title}", body, "result", sittingId);
+
+        var percent = Marking.Percent(row.SectionAScore, row.SectionAMax);
+        var marks = $"Score: {row.SectionAScore} of {row.SectionAMax} ({percent}%).";
+        string subject;
+        string body;
+        if (row.Status == SittingStatus.Expired)
+        {
+            subject = $"Result for {row.Title}: Fail";
+            body = $"Hello {row.FullName},\n\nThe clock ended before you submitted Section A of {row.Title}.\nScore: 0 of {row.SectionAMax}.\nYou needed 70% to open the written paper (Section B). The result is Fail.\n";
+        }
+        else if (row.Status == SittingStatus.Failed || !Marking.Passed(row.SectionAScore, row.SectionAMax))
+        {
+            subject = $"Result for {row.Title}: Fail";
+            body = $"Hello {row.FullName},\n\nSection A (objectives) of {row.Title} is marked.\n{marks}\nYou needed 70% to open the written paper (Section B). The result is Fail.\n";
+        }
+        else if (row.SectionBMax == 0)
+        {
+            subject = $"Result for {row.Title}: Pass";
+            body = $"Hello {row.FullName},\n\nSection A (objectives) of {row.Title} is marked.\n{marks}\nYou reached 70%. This paper has no written section. Your result is {row.SectionAScore} of {row.SectionAMax}.\n";
+        }
+        else
+        {
+            subject = $"Result for {row.Title}: Pass";
+            body = $"Hello {row.FullName},\n\nSection A (objectives) of {row.Title} is marked.\n{marks}\nYou reached 70%, so the written paper (Section B) is open. Those answers are saved and are not marked by the system. An examiner will award the marks.\n";
+        }
+
+        await Send(db, row.Email, subject, body, "gate", sittingId);
+    }
+
+    public static async Task SendWritten(AppDb db, int sittingId)
+    {
+        var row = await (
+            from sitting in db.Sittings.AsNoTracking()
+            join student in db.Users.AsNoTracking() on sitting.StudentId equals student.Id
+            join paper in db.Assessments.AsNoTracking() on sitting.AssessmentId equals paper.Id
+            where sitting.Id == sittingId
+            select new
+            {
+                student.Email,
+                student.FullName,
+                paper.Title,
+                sitting.Score,
+                sitting.MaxScore,
+                sitting.SectionAScore,
+                sitting.SectionAMax,
+                sitting.SectionBScore,
+                sitting.SectionBMax
+            }
+        ).FirstOrDefaultAsync();
+        if (row is null || string.IsNullOrWhiteSpace(row.Email))
+            return;
+
+        var percent = Marking.Percent(row.SectionAScore, row.SectionAMax);
+        var body = $"Hello {row.FullName},\n\nThe examiner has marked the written section of {row.Title}.\nSection A: {row.SectionAScore} of {row.SectionAMax} ({percent}%).\nSection B: {row.SectionBScore} of {row.SectionBMax}.\nTotal: {row.Score} of {row.MaxScore}.\n";
+        await Send(db, row.Email, $"Written marks for {row.Title}", body, "written", sittingId);
     }
 
     private static async Task<MailReceipt> Send(AppDb db, string email, string subject, string body, string kind, int? sittingId)
@@ -357,7 +416,6 @@ public static class IdentitySchema
                 "CreatedAt" text NOT NULL,
                 "UsedAt" text
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS "IX_Invites_Email" ON "Invites" ("Email");
             ALTER TABLE "Invites" ADD COLUMN IF NOT EXISTS "AssessmentId" integer;
             DROP INDEX IF EXISTS "IX_Invites_Email";
             CREATE UNIQUE INDEX IF NOT EXISTS "IX_Invites_Email_Test" ON "Invites" ("Email", "AssessmentId");
@@ -406,6 +464,23 @@ public static class IdentitySchema
                 "CreatedAt" text NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS "IX_OutboundMail_Result" ON "OutboundMail" ("Kind", "SittingId") WHERE "SittingId" IS NOT NULL;
+            ALTER TABLE "Questions" ADD COLUMN IF NOT EXISTS "Section" text NOT NULL DEFAULT 'A';
+            UPDATE "Questions" SET "Section" = 'B' WHERE "Type" = 'short' AND "Section" <> 'B';
+            ALTER TABLE "Sittings" ADD COLUMN IF NOT EXISTS "Stage" text NOT NULL DEFAULT 'A';
+            ALTER TABLE "Sittings" ADD COLUMN IF NOT EXISTS "SectionAScore" integer NOT NULL DEFAULT 0;
+            ALTER TABLE "Sittings" ADD COLUMN IF NOT EXISTS "SectionAMax" integer NOT NULL DEFAULT 0;
+            ALTER TABLE "Sittings" ADD COLUMN IF NOT EXISTS "SectionBScore" integer NOT NULL DEFAULT 0;
+            ALTER TABLE "Sittings" ADD COLUMN IF NOT EXISTS "SectionBMax" integer NOT NULL DEFAULT 0;
+            CREATE TABLE IF NOT EXISTS "AuditTrail" (
+                "Id" integer GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                "At" text NOT NULL,
+                "ActorId" integer,
+                "ActorName" text NOT NULL,
+                "ActorEmail" text NOT NULL,
+                "Action" text NOT NULL,
+                "Detail" text NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS "IX_AuditTrail_Id" ON "AuditTrail" ("Id" DESC);
             """;
         await command.ExecuteNonQueryAsync();
     }
@@ -504,6 +579,7 @@ public static class PeopleEndpoints
             await db.SaveChangesAsync();
             await MarkInviteUsed(db, ready.Email);
             var mail = await Mailbox.SendWelcome(db, user.Email, user.FullName);
+            await Audit.Note(db, user.Id, user.FullName, user.Email, "Candidate joined", $"{user.FullName} joined from the invitation sheet.");
             await Sessions.SignIn(http, user);
             return Results.Ok(new { id = user.Id, fullName = user.FullName, email = user.Email, role = user.Role, mail });
         });
@@ -560,6 +636,7 @@ public static class PeopleEndpoints
             db.Users.Add(user);
             await db.SaveChangesAsync();
             var mail = await Mailbox.SendStaff(db, email, name, body.Role, body.Password);
+            await Audit.Note(db, actor, "Staff created", $"{name} ({email}) was created as {Audit.RoleName(body.Role)}.");
             return Results.Ok(new { id = user.Id, fullName = user.FullName, email = user.Email, role = user.Role, mail });
         }).RequireAuthorization();
 
@@ -576,8 +653,10 @@ public static class PeopleEndpoints
                 return Results.NotFound();
             if (person.Role == AccountRoles.SystemAdmin && body.Role != AccountRoles.SystemAdmin && await LastSystemAdmin(db, person.Id))
                 return Results.BadRequest(new { error = "Keep at least one system admin." });
+            var previous = person.Role;
             person.Role = body.Role;
             await db.SaveChangesAsync();
+            await Audit.Note(db, actor, "Role changed", $"{person.FullName} changed from {Audit.RoleName(previous)} to {Audit.RoleName(body.Role)}.");
             return Results.NoContent();
         }).RequireAuthorization();
 
@@ -594,6 +673,7 @@ public static class PeopleEndpoints
                 return Results.BadRequest(new { error = "Keep at least one system admin." });
             person.Active = body.Active;
             await db.SaveChangesAsync();
+            await Audit.Note(db, actor, "Account switched", $"{person.FullName} was switched {(body.Active ? "on" : "off")}.");
             return Results.NoContent();
         }).RequireAuthorization();
 
@@ -646,6 +726,7 @@ public static class PeopleEndpoints
                 else
                     already++;
             }
+            await Audit.Note(db, actor, "Invitations uploaded", $"{file.FileName}: {added} added, {already} already on a paper, {invalid.Count} skipped.");
             return Results.Ok(new { added, already, invalid = invalid.Take(8).ToList(), invalidCount = invalid.Count });
         }).RequireAuthorization();
 
@@ -829,6 +910,9 @@ public static class PeopleEndpoints
             rows.Add(reader.GetString(0));
         return rows;
     }
+
+    public static Task<bool> GiveExam(AppDb db, string email, int assessmentId) =>
+        AssignInvite(db, email, assessmentId, DateTimeOffset.UtcNow.ToString("O"));
 
     private static async Task<bool> AssignInvite(AppDb db, string email, int assessmentId, string now)
     {

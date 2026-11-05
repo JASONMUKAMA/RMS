@@ -1,12 +1,99 @@
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "Outfit", "Segoe UI", sans-serif;
-  --font-serif: "Fraunces", Georgia, serif;
+  --font-sans: "Roboto", "Segoe UI", sans-serif;
+  --font-serif: "Roboto", "Segoe UI", sans-serif;
+  --color-mdb: #3b71ca;
 }
 
 body {
   margin: 0;
+  background: #fbfbfb;
+  color: #4f4f4f;
+  font-family: Roboto, "Segoe UI", sans-serif;
+}
+
+a {
+  color: #3b71ca;
+}
+
+input,
+textarea,
+select {
+  accent-color: #3b71ca;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  outline: none;
+  border-color: #3b71ca !important;
+  box-shadow: 0 1px 0 0 #3b71ca;
+}
+
+main h1.font-serif,
+main h2.font-serif {
+  font-weight: 500;
+  letter-spacing: 0;
+  color: #332d2d;
+}
+
+main h1.font-serif {
+  font-size: 1.75rem;
+  line-height: 1.3;
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+button.rounded-full.bg-stone-950,
+a.rounded-full.bg-stone-950 {
+  border-radius: 0.25rem;
+  background: #3b71ca !important;
+  color: #fff !important;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  box-shadow: 0 4px 9px -4px #3b71ca;
+}
+
+button.rounded-full.bg-stone-950:hover,
+a.rounded-full.bg-stone-950:hover {
+  background: #386bc0 !important;
+  box-shadow: 0 8px 9px -4px rgba(59, 113, 202, 0.4);
+}
+
+button.rounded-full.bg-stone-950:disabled {
+  background: #e0e0e0 !important;
+  color: #9e9e9e !important;
+  box-shadow: none;
+}
+
+button.rounded-full.border.bg-white:not([class*="text-red"]),
+a.rounded-full.border.bg-white:not([class*="text-red"]) {
+  border-radius: 0.25rem;
+  border: 2px solid #3b71ca !important;
+  background: #fff !important;
+  color: #3b71ca !important;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  box-shadow: none;
+}
+
+button.rounded-full.border.bg-white:not([class*="text-red"]):hover,
+a.rounded-full.border.bg-white:not([class*="text-red"]):hover {
+  background: #3b71ca !important;
+  color: #fff !important;
+}
+
+[class*="rounded-3xl"][class*="bg-white"] {
+  border-radius: 0.5rem !important;
+  border-color: transparent !important;
+  box-shadow: 0 2px 15px -3px rgba(0, 0, 0, 0.07), 0 10px 20px -2px rgba(0, 0, 0, 0.04);
 }
 
 button, input, textarea, select {
@@ -14,29 +101,53 @@ button, input, textarea, select {
 }
 
 .dataTables_wrapper {
-  color: #1c1917;
+  color: #4f4f4f;
 }
 
 .dataTables_wrapper .dt-search input,
 .dataTables_wrapper .dt-input,
 .dataTables_wrapper select {
-  border: 1px solid #d6d3d1;
-  border-radius: 0.75rem;
+  border: 1px solid #bdbdbd;
+  border-radius: 0.25rem;
   padding: 0.45rem 0.75rem;
   background: white;
+}
+
+.dataTables_wrapper .dt-search input:focus,
+.dataTables_wrapper .dt-input:focus,
+.dataTables_wrapper select:focus {
+  border-color: #3b71ca;
+  outline: 1px solid #3b71ca;
 }
 
 .dataTables_wrapper table.dataTable {
   width: 100% !important;
   background: white;
-  border-radius: 1rem;
+  border-radius: 0.5rem;
   overflow: hidden;
+  box-shadow: 0 2px 15px -3px rgba(0, 0, 0, 0.07), 0 10px 20px -2px rgba(0, 0, 0, 0.04);
+}
+
+.dataTables_wrapper .dt-paging .dt-paging-button {
+  border: 0 !important;
+  border-radius: 0.25rem !important;
+  margin: 0 0.15rem;
+  color: #4f4f4f !important;
+  background: transparent !important;
+}
+
+.dataTables_wrapper .dt-paging .dt-paging-button.current {
+  background: #3b71ca !important;
+  color: #fff !important;
 }
 
 table.dataTable thead th {
-  background: #1c1917;
-  color: #fafaf9;
-  font-weight: 560;
+  background: #3b71ca;
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
   padding: 0.8rem 0.9rem !important;
   border: 0 !important;
 }

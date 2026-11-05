@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using RMS.Api;
 using ClosedXML.Excel;
@@ -27,22 +28,18 @@ public static partial class AssessmentFactory
         }
     }
 
-    public static List<Question> ReadWord(Stream stream)
+    public static List<Question> ReadWord(Stream stream) => ReadWord(stream, null);
+
+    public static List<Question> ReadWord(Stream stream, Stream? answers)
     {
         try
         {
-            using var document = WordprocessingDocument.Open(stream, false);
-            var body = document.MainDocumentPart?.Document?.Body ?? throw new InvalidDataException("This Word file has no text.");
-            var table = body.Elements<Table>().FirstOrDefault();
-            if (table is not null)
-            {
-                var rows = table.Elements<TableRow>().Select(row =>
-                    row.Elements<TableCell>().Select(cell => cell.InnerText.Trim()).ToList()).ToList();
-                return FromRows(rows);
-            }
-
-            var lines = body.Elements<Paragraph>().Select(paragraph => paragraph.InnerText.Trim()).Where(line => line.Length > 0);
-            return ReadWordLines(lines);
+            var draft = LoadDraft(stream);
+            if (answers is not null)
+                draft.Absorb(LoadDraft(answers));
+            if (draft.Slots.Count == 0 && draft.Scenarios.Count == 0)
+                return ReadWordLines(draft.Lines);
+            return draft.Build();
         }
         catch (InvalidDataException)
         {
@@ -51,6 +48,208 @@ public static partial class AssessmentFactory
         catch (Exception)
         {
             throw new InvalidDataException("That Word file could not be read. Use a .docx table or a question list.");
+        }
+    }
+
+    private static PaperDraft LoadDraft(Stream stream)
+    {
+        using var buffer = new MemoryStream();
+        stream.CopyTo(buffer);
+        buffer.Position = 0;
+        using var document = WordprocessingDocument.Open(buffer, false);
+        var body = document.MainDocumentPart?.Document?.Body ?? throw new InvalidDataException("This Word file has no text.");
+        var draft = new PaperDraft();
+        var mode = "";
+        var marks = 1;
+        var modelTitle = "";
+        var model = new List<string>();
+
+        void FlushModel()
+        {
+            if (modelTitle.Length == 0)
+                return;
+            draft.Notes.Add((modelTitle, string.Join(" ", model.Where(line => line.Length > 0))));
+            modelTitle = "";
+            model.Clear();
+        }
+
+        foreach (var child in body.ChildElements)
+        {
+            if (child is Paragraph paragraph)
+            {
+                var line = paragraph.InnerText.Trim();
+                if (line.Length == 0)
+                    continue;
+                draft.Lines.Add(line);
+                if (ModelHeading(line))
+                {
+                    FlushModel();
+                    mode = "model";
+                    modelTitle = line;
+                    var each = MarkEach(line);
+                    if (each is int found)
+                        marks = found;
+                    continue;
+                }
+                if (mode == "model")
+                {
+                    if (RubricLine(line))
+                    {
+                        FlushModel();
+                        mode = "";
+                    }
+                    else if (!SkipNote(line))
+                        model.Add(line);
+                    continue;
+                }
+                if (SectionLine(line) || EndLine(line))
+                {
+                    mode = "";
+                    continue;
+                }
+                var eachMark = MarkEach(line);
+                if (eachMark is int nextMarks)
+                    marks = nextMarks;
+                if (TrueFalseHeading(line))
+                {
+                    mode = "tf";
+                    continue;
+                }
+                if (ShortHeading(line))
+                {
+                    mode = "short";
+                    continue;
+                }
+                if (ChoiceHeading(line))
+                {
+                    mode = "";
+                    continue;
+                }
+                if (mode == "tf")
+                    draft.Add(line, ["True", "False"], "", marks);
+                else if (mode == "short")
+                    draft.Add(line, null, "", marks);
+                continue;
+            }
+
+            if (child is not Table table)
+                continue;
+            FlushModel();
+            mode = "";
+            var rows = table.Elements<TableRow>().Select(row =>
+                row.Elements<TableCell>().Select(cell => cell.InnerText.Trim()).ToList()).ToList();
+            rows = rows.Where(row => row.Any(cell => cell.Length > 0)).ToList();
+            if (rows.Count == 0)
+                continue;
+            ReadTable(draft, rows, ref marks);
+        }
+        FlushModel();
+        return draft;
+    }
+
+    private static void ReadTable(PaperDraft draft, List<List<string>> rows, ref int marks)
+    {
+        if (rows[0][0].StartsWith("Scenario", StringComparison.OrdinalIgnoreCase) && !HeaderKind(rows[0]).Contains('s'))
+        {
+            for (var index = 0; index < rows.Count;)
+            {
+                var row = rows[index];
+                if (row[0].StartsWith("Scenario", StringComparison.OrdinalIgnoreCase))
+                {
+                    var title = row.Count > 1 ? row[1] : row[0];
+                    var prompt = index + 1 < rows.Count ? string.Join(" ", rows[index + 1]) : "";
+                    var each = MarkEach(title) ?? marks;
+                    draft.Scenarios.Add(new PaperScenario(title, prompt, each));
+                    index += prompt.Length > 0 ? 2 : 1;
+                    continue;
+                }
+                index++;
+            }
+            return;
+        }
+
+        var kinds = HeaderKind(rows[0]);
+        if (kinds.Contains('q') && kinds.Contains('o'))
+        {
+            var numberAt = kinds.IndexOf('n');
+            var questionAt = kinds.IndexOf('q');
+            var optionAt = kinds.IndexOf('o');
+            foreach (var row in rows.Skip(1))
+            {
+                if (questionAt >= row.Count)
+                    continue;
+                var prompt = row[questionAt];
+                var packed = optionAt < row.Count ? SplitPacked(row[optionAt]) : null;
+                var number = numberAt >= 0 && numberAt < row.Count && int.TryParse(row[numberAt], out var parsed) ? parsed : 0;
+                draft.Add(prompt, packed, "", marks, number);
+            }
+            return;
+        }
+
+        if (kinds.Contains('n') && kinds.Contains('a'))
+        {
+            var pairs = new List<(int Number, int Answer, int Marks)>();
+            var seen = -1;
+            for (var index = 0; index < kinds.Length; index++)
+            {
+                if (kinds[index] != 'n' || index < seen)
+                    continue;
+                var answerAt = -1;
+                var marksAt = -1;
+                for (var next = index + 1; next < kinds.Length; next++)
+                {
+                    if (kinds[next] == 'a' && answerAt < 0)
+                        answerAt = next;
+                    else if ((kinds[next] is 'm' or 'c') && marksAt < 0)
+                        marksAt = next;
+                    else if (kinds[next] == 'n')
+                        break;
+                }
+                if (answerAt >= 0)
+                    pairs.Add((index, answerAt, marksAt));
+                seen = index;
+            }
+            foreach (var row in rows.Skip(1))
+            {
+                foreach (var (numberAt, answerAt, marksAt) in pairs)
+                {
+                    if (numberAt >= row.Count || answerAt >= row.Count)
+                        continue;
+                    if (!int.TryParse(row[numberAt], out var number))
+                        continue;
+                    draft.Answers[number] = row[answerAt];
+                    if (marksAt >= 0 && marksAt < row.Count && LeadingInt(row[marksAt]) is int scored)
+                        draft.Marks[number] = scored;
+                }
+            }
+            return;
+        }
+
+        if (kinds.Contains('s') && (kinds.Contains('c') || kinds.Contains('m')))
+        {
+            var titleAt = kinds.IndexOf('s');
+            var criteriaAt = kinds.IndexOf('c');
+            var marksAt = kinds.IndexOf('m');
+            foreach (var row in rows.Skip(1))
+            {
+                if (titleAt >= row.Count)
+                    continue;
+                var criteria = criteriaAt >= 0 && criteriaAt < row.Count ? row[criteriaAt] : "";
+                var scored = marksAt >= 0 && marksAt < row.Count && LeadingInt(row[marksAt]) is int found ? found : 0;
+                draft.Keys.Add((row[titleAt], criteria, scored));
+            }
+            return;
+        }
+
+        if (kinds.Contains('q') && kinds.Contains('a') || rows[0].Count >= 7)
+        {
+            foreach (var question in FromRows(rows))
+            {
+                List<string>? options = question.Type == "mcq"
+                    ? JsonSerializer.Deserialize<List<string>>(question.OptionsJson)
+                    : null;
+                draft.Add(question.Prompt, options, question.Answer, question.Marks);
+            }
         }
     }
 
@@ -189,4 +388,200 @@ public static partial class AssessmentFactory
     private static Regex AnswerPattern() => new(@"^(answer|correct)\s*[:\-]\s*(.+)$", RegexOptions.IgnoreCase);
 
     private static Regex MarksPattern() => new(@"^(?:marks|mark|points)\s*[:\-]\s*(\d+)\s*$", RegexOptions.IgnoreCase);
+
+    private static string HeaderKind(List<string> header) => string.Concat(header.Select(KindOf));
+
+    private static char KindOf(string cell)
+    {
+        var text = cell.Trim().ToLowerInvariant();
+        return text switch
+        {
+            "q" or "#" or "sn" or "no" or "no." or "number" => 'n',
+            "question" or "prompt" => 'q',
+            "options" or "option" or "choices" or "choice" => 'o',
+            "answer" or "correct" or "key" or "correct answer" or "expected answer" => 'a',
+            "marks" or "mark" or "points" or "score" => 'm',
+            "criteria" or "marking guide" or "guide" => 'c',
+            "scenario" => 's',
+            _ => ' '
+        };
+    }
+
+    private static List<string>? SplitPacked(string cell)
+    {
+        cell = Regex.Replace(cell, @"(?<=\S)([A-D][\)\.])", " $1");
+        var matches = Regex.Matches(cell, @"(?:^|\s)([A-D])[\)\.]\s*", RegexOptions.IgnoreCase);
+        if (matches.Count < 2)
+            return null;
+        var options = new List<string>();
+        for (var index = 0; index < matches.Count; index++)
+        {
+            var start = matches[index].Index + matches[index].Length;
+            var end = index + 1 < matches.Count ? matches[index + 1].Index : cell.Length;
+            var text = cell[start..end].Trim();
+            if (text.Length == 0)
+                return null;
+            options.Add(text);
+        }
+        return options;
+    }
+
+    private static bool SectionLine(string line) => Regex.IsMatch(line, @"^section\b", RegexOptions.IgnoreCase);
+
+    private static bool EndLine(string line) => Regex.IsMatch(line, @"^(end|instructions|answer all)\b", RegexOptions.IgnoreCase);
+
+    private static bool TrueFalseHeading(string line) => Regex.IsMatch(line, @"true\s*/\s*false", RegexOptions.IgnoreCase);
+
+    private static bool ShortHeading(string line) =>
+        Regex.IsMatch(line, @"\bshort\b", RegexOptions.IgnoreCase) && Regex.IsMatch(line, @"mark|logic|answer|question", RegexOptions.IgnoreCase);
+
+    private static bool ChoiceHeading(string line) => Regex.IsMatch(line, @"multiple\s*choice", RegexOptions.IgnoreCase);
+
+    private static bool ModelHeading(string line) => Regex.IsMatch(line, @"^\d+\)\s+\S", RegexOptions.IgnoreCase);
+
+    private static bool RubricLine(string line) => Regex.IsMatch(line, @"^rubric\b", RegexOptions.IgnoreCase);
+
+    private static bool SkipNote(string line) =>
+        Regex.IsMatch(line, @"^(candidate must mention|must include|model answers)\b", RegexOptions.IgnoreCase);
+
+    private static int? MarkEach(string line)
+    {
+        if (SectionLine(line))
+            return null;
+        var matches = Regex.Matches(line, @"(\d+)\s*marks?", RegexOptions.IgnoreCase);
+        if (matches.Count == 0 || !int.TryParse(matches[^1].Groups[1].Value, out var marks) || marks < 1)
+            return null;
+        return marks;
+    }
+
+    private static int? LeadingInt(string text)
+    {
+        var match = Regex.Match(text.Trim(), @"^(\d+)\b");
+        return match.Success && int.TryParse(match.Groups[1].Value, out var number) ? number : null;
+    }
+
+    private static string Norm(string text) =>
+        Regex.Replace(text.ToLowerInvariant(), @"[^a-z0-9@]+", "");
+
+    private static string Letter(List<string> options, string raw)
+    {
+        var trimmed = raw.Trim().TrimEnd('.').Trim();
+        if (trimmed.Length == 1)
+        {
+            var choice = char.ToUpperInvariant(trimmed[0]) - 'A';
+            if (choice >= 0 && choice < options.Count)
+                return ((char)('A' + choice)).ToString();
+        }
+        var wanted = Norm(trimmed);
+        if (wanted.Length == 0)
+            return "";
+        var ranked = options.Select((option, index) => (option: Norm(option), index))
+            .Where(item => item.option.Length > 0 && (item.option == wanted || wanted.Contains(item.option) || item.option.Contains(wanted)))
+            .OrderByDescending(item => item.option == wanted)
+            .ThenByDescending(item => item.option.Length)
+            .ToList();
+        if (ranked.Count == 0)
+            return "";
+        if (ranked.Count > 1 && ranked[0].option.Length == ranked[1].option.Length && ranked[0].option != wanted)
+            return "";
+        return ((char)('A' + ranked[0].index)).ToString();
+    }
+
+    private static string Stem(string word) => word.Length > 4 && word.EndsWith('s') ? word[..^1] : word;
+
+    private static int Overlap(string left, string right)
+    {
+        var words = new HashSet<string>(Regex.Split(left.ToLowerInvariant(), @"[^a-z0-9]+").Where(word => word.Length > 3).Select(Stem));
+        return Regex.Split(right.ToLowerInvariant(), @"[^a-z0-9]+").Where(word => word.Length > 3).Select(Stem).Count(words.Contains);
+    }
+
+    private sealed class PaperDraft
+    {
+        public List<string> Lines { get; } = [];
+        public List<PaperSlot> Slots { get; } = [];
+        public List<PaperScenario> Scenarios { get; } = [];
+        public Dictionary<int, string> Answers { get; } = [];
+        public Dictionary<int, int> Marks { get; } = [];
+        public List<(string Title, string Criteria, int Marks)> Keys { get; } = [];
+        public List<(string Title, string Text)> Notes { get; } = [];
+        public int Next { get; private set; } = 1;
+
+        public void Add(string prompt, List<string>? options, string answer, int marks, int number = 0)
+        {
+            if (string.IsNullOrWhiteSpace(prompt))
+                return;
+            if (number <= 0)
+                number = Next;
+            if (number >= Next)
+                Next = number + 1;
+            Slots.Add(new PaperSlot(number, prompt.Trim(), options, answer.Trim(), marks < 1 ? 1 : marks));
+        }
+
+        public void Absorb(PaperDraft other)
+        {
+            foreach (var pair in other.Answers)
+                Answers[pair.Key] = pair.Value;
+            foreach (var pair in other.Marks)
+                Marks[pair.Key] = pair.Value;
+            Keys.AddRange(other.Keys);
+            Notes.AddRange(other.Notes);
+        }
+
+        public List<Question> Build()
+        {
+            var writes = new List<QuestionWrite>();
+            var missing = new List<string>();
+            foreach (var slot in Slots.OrderBy(item => item.Number))
+            {
+                var scored = Marks.TryGetValue(slot.Number, out var fromKey) ? fromKey : slot.Marks;
+                var answer = slot.Answer;
+                if (answer.Length == 0 && Answers.TryGetValue(slot.Number, out var raw))
+                    answer = slot.Options is null ? raw.Trim() : Letter(slot.Options, raw);
+                if (string.IsNullOrWhiteSpace(answer))
+                    missing.Add(slot.Number.ToString());
+                var choice = slot.Options is { Count: >= 2 };
+                writes.Add(new QuestionWrite(choice ? "mcq" : "short", slot.Prompt, choice ? slot.Options : null, answer, scored));
+            }
+            foreach (var scenario in Scenarios)
+            {
+                var answer = ModelFor(scenario.Title);
+                var scored = scenario.Marks;
+                var key = BestKey(scenario.Title);
+                if (key.Marks > 0)
+                    scored = key.Marks;
+                if (string.IsNullOrWhiteSpace(answer))
+                    missing.Add(scenario.Title);
+                writes.Add(new QuestionWrite("short", $"{scenario.Title}. {scenario.Prompt}".Trim().TrimEnd('.'), null, answer, scored < 1 ? 1 : scored));
+            }
+            if (writes.Count == 0)
+                throw new InvalidDataException("The Word file has no questions.");
+            if (missing.Count == writes.Count)
+                throw new InvalidDataException("The questions were read, but this file has no answers. Add the answer sheet in the second box, then upload again.");
+            if (missing.Count > 0)
+                throw new InvalidDataException($"These questions have no answer: {string.Join(", ", missing)}.");
+            return FromWrites(writes);
+        }
+
+        private string ModelFor(string title)
+        {
+            var parts = new List<string>();
+            var key = BestKey(title);
+            if (key.Criteria.Length > 0)
+                parts.Add(key.Criteria);
+            var note = Notes.Select(item => (item.Text, Score: Overlap(title, item.Title))).OrderByDescending(item => item.Score).FirstOrDefault();
+            if (note.Score > 0 && note.Text.Length > 0)
+                parts.Add(note.Text);
+            return string.Join(" ", parts);
+        }
+
+        private (string Title, string Criteria, int Marks) BestKey(string title)
+        {
+            var best = Keys.Select(item => (item, Score: Overlap(title, item.Title))).OrderByDescending(item => item.Score).FirstOrDefault();
+            return best.Score > 0 ? best.item : ("", "", 0);
+        }
+    }
+
+    private sealed record PaperSlot(int Number, string Prompt, List<string>? Options, string Answer, int Marks);
+
+    private sealed record PaperScenario(string Title, string Prompt, int Marks);
 }

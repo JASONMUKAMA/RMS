@@ -29,19 +29,20 @@ public sealed class ExpiryWorker(IServiceScopeFactory scopes, IHubContext<DeskHu
         var now = DateTimeOffset.UtcNow;
         var open = await db.Sittings
             .Include(s => s.Answers)
+            .Include(s => s.Assessment)!.ThenInclude(a => a!.Questions)
             .Where(s => s.Status == SittingStatus.InProgress)
             .ToListAsync(stoppingToken);
         var due = open.Where(s => s.EndsAt <= now).ToList();
 
         foreach (var sitting in due)
         {
-            if (!ExamClock.TryExpire(sitting, now))
+            if (!PaperGate.TimeUp(sitting, now))
                 continue;
             await hub.Clients.Group(DeskHub.Group(sitting.Id)).SendAsync("expired", new
             {
                 sittingId = sitting.Id,
                 status = sitting.Status,
-                score = 0,
+                score = sitting.Score,
                 phase = nameof(ClockPhase.Ended).ToLowerInvariant()
             }, stoppingToken);
         }
@@ -49,8 +50,12 @@ public sealed class ExpiryWorker(IServiceScopeFactory scopes, IHubContext<DeskHu
         if (due.Count > 0)
         {
             await db.SaveChangesAsync(stoppingToken);
-            foreach (var sitting in due.Where(item => item.Status == SittingStatus.Expired))
+            foreach (var sitting in due.Where(item => item.Status is SittingStatus.Expired or SittingStatus.Awaiting))
+            {
                 await ExamLog.Seal(db, sitting.Id);
+                if (sitting.Status == SittingStatus.Expired)
+                    await Mailbox.SendGate(db, sitting.Id);
+            }
         }
     }
 }

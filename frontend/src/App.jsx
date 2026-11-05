@@ -5,12 +5,13 @@ import "datatables.net-dt/css/dataTables.dataTables.css";
 import { api } from "./api";
 import ExamRoom from "./ExamRoom";
 import { openViewer } from "./liveDesk";
-import { CheckBanners, JoinWizard, SearchSelect, SystemAdmin, pill, roleLabel, useExamChecks } from "./People";
+import { AuditPage, CheckBanners, HelpGuide, JoinWizard, SearchSelect, SystemAdmin, pill, roleLabel, useExamChecks } from "./People";
+import { NavIcon } from "./icons";
 
 const blankQuestion = () => ({ type: "mcq", prompt: "", a: "", b: "", c: "", d: "", answer: "A", marks: 1 });
-const field = "mt-1 w-full rounded-xl border border-stone-300 bg-white px-3 py-2.5 outline-none transition focus:border-stone-900 focus:ring-2 focus:ring-stone-900/10";
-const primary = "inline-flex items-center justify-center gap-2 rounded-full bg-stone-950 px-5 py-2.5 text-sm font-medium text-stone-50 shadow-sm transition hover:bg-stone-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-stone-950 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:text-stone-500";
-const ghost = "inline-flex items-center justify-center gap-2 rounded-full border border-stone-300 bg-white px-5 py-2.5 text-sm font-medium text-stone-800 shadow-sm transition hover:border-stone-400 hover:bg-stone-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-stone-400 disabled:cursor-not-allowed disabled:opacity-50";
+const field = "mt-1 w-full rounded border border-[#bdbdbd] bg-white px-3 py-2.5 text-sm outline-none transition focus:border-[#3b71ca] focus:shadow-[0_1px_0_0_#3b71ca]";
+const primary = "inline-flex items-center justify-center gap-2 rounded bg-[#3b71ca] px-5 py-2.5 text-xs font-medium uppercase tracking-wider text-white shadow-[0_4px_9px_-4px_#3b71ca] transition hover:bg-[#386bc0] hover:shadow-[0_8px_9px_-4px_rgba(59,113,202,0.45)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3b71ca] disabled:cursor-not-allowed disabled:bg-[#e0e0e0] disabled:text-[#9e9e9e] disabled:shadow-none";
+const ghost = "inline-flex items-center justify-center gap-2 rounded border-2 border-[#3b71ca] bg-white px-5 py-2.5 text-xs font-medium uppercase tracking-wider text-[#3b71ca] transition hover:bg-[#3b71ca] hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#3b71ca] disabled:cursor-not-allowed disabled:opacity-50";
 
 export default function App() {
   const [me, setMe] = useState(undefined);
@@ -39,18 +40,20 @@ export default function App() {
 
 function Desk({ me, onLogout, nav, alerts, note, children }) {
   return (
-    <div className="min-h-screen bg-stone-100 text-stone-900 md:grid md:grid-cols-[260px_1fr]">
-      <aside className="flex flex-col gap-6 bg-stone-950 px-4 py-5 text-stone-100 md:sticky md:top-0 md:h-screen">
-        <div>
-          <p className="text-xs tracking-[0.22em] text-amber-200">RMS</p>
-          <strong className="mt-3 block font-serif text-2xl font-medium">{me.fullName}</strong>
-          <em className="mt-1 block text-sm text-stone-400 not-italic">{roleLabel(me.role)}</em>
+    <div className="min-h-screen bg-[#fbfbfb] text-[#4f4f4f] md:grid md:grid-cols-[260px_1fr]">
+      <aside className="flex flex-col border-r border-black/5 border-t-4 border-t-[#3b71ca] bg-white px-3 py-5 shadow-[0_2px_15px_-3px_rgba(0,0,0,0.07)] md:sticky md:top-0 md:h-screen md:overflow-hidden">
+        <div className="shrink-0 px-2">
+          <p className="text-xs font-medium uppercase tracking-[0.16em] text-[#3b71ca]">RMS</p>
+          <strong className="mt-2 block text-lg font-medium text-[#332d2d]">{me.fullName}</strong>
+          <em className="mt-0.5 block text-sm text-[#757575] not-italic">{roleLabel(me.role)}</em>
         </div>
-        <nav className="flex flex-col gap-1">{nav}</nav>
-        <p className="mt-auto text-xs leading-5 text-stone-400">
-          {note || "Face and posture run in the exam page. Short answers of 30 characters or more are compared on this server. A raised hand is still a button, not a camera gesture."}
-        </p>
-        <button className="rounded-full border border-white/15 px-4 py-2 text-sm text-stone-200 hover:bg-white/10" type="button" onClick={onLogout}>Sign out</button>
+        <nav className="mt-6 flex flex-col gap-1 md:min-h-0 md:flex-1 md:overflow-y-auto">{nav}</nav>
+        <div className="shrink-0 space-y-3 pt-4">
+          <p className="line-clamp-3 px-2 text-xs leading-5 text-[#757575]">
+            {note || "Face and posture run in the exam page. Short answers of 30 characters or more are compared on this server. A raised hand is still a button, not a camera gesture."}
+          </p>
+          <button className="flex w-full items-center justify-center gap-2 rounded border-2 border-[#3b71ca] px-4 py-2 text-xs font-medium uppercase tracking-wider text-[#3b71ca] hover:bg-[#3b71ca] hover:text-white" type="button" onClick={onLogout}><NavIcon name="out" />Sign out</button>
+        </div>
       </aside>
       <main className="min-w-0 px-5 py-6 md:px-8 md:py-8">
         {alerts}
@@ -60,14 +63,15 @@ function Desk({ me, onLogout, nav, alerts, note, children }) {
   );
 }
 
-function NavButton({ active, onClick, children }) {
+function NavButton({ active, onClick, icon, children }) {
   return (
     <button
-      className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm ${active ? "bg-white text-stone-950" : "text-stone-200 hover:bg-white/10"}`}
+      className={`flex w-full items-center gap-2 rounded px-3 py-2 text-left text-sm transition ${active ? "bg-[#3b71ca]/10 font-medium text-[#3b71ca]" : "text-[#4f4f4f] hover:bg-black/[0.04]"}`}
       type="button"
       onClick={onClick}
     >
-      {children}
+      <NavIcon name={icon} />
+      <span className="flex min-w-0 flex-1 items-center justify-between gap-2">{children}</span>
     </button>
   );
 }
@@ -82,6 +86,16 @@ function Login({ onDone, onJoin }) {
   const [email, setEmail] = useState("leila.nansubuga@rms.local");
   const [password, setPassword] = useState("Harbor-Teach-19");
   const [error, setError] = useState("");
+  const [help, setHelp] = useState(false);
+
+  if (help) {
+    return (
+      <main className="min-h-screen bg-stone-100 px-6 py-10">
+        <button className={`${ghost} mb-6`} type="button" onClick={() => setHelp(false)}>Back to sign in</button>
+        <HelpGuide />
+      </main>
+    );
+  }
 
   async function submit(event) {
     event.preventDefault();
@@ -93,23 +107,24 @@ function Login({ onDone, onJoin }) {
   }
 
   return (
-    <main className="min-h-screen bg-stone-100 lg:grid lg:grid-cols-2">
-      <section className="flex flex-col justify-between bg-stone-950 px-8 py-10 text-stone-100">
-        <p className="text-xs tracking-[0.22em] text-amber-200">RMS</p>
+    <main className="grid min-h-screen grid-cols-1 bg-[#fbfbfb] md:grid-cols-2">
+      <section className="flex min-h-[46vh] flex-col justify-between bg-[#3b71ca] px-8 py-10 text-white md:min-h-screen">
+        <p className="text-xs font-medium tracking-[0.2em] text-white/80">RMS</p>
         <div className="max-w-md">
-          <h1 className="font-serif text-5xl font-medium leading-tight">The exam desk</h1>
-          <p className="mt-4 text-stone-300">Each paper keeps its own clock. The camera asks before it starts. A raised hand shows up here as an alert.</p>
+          <h1 className="text-5xl font-medium leading-tight">The exam desk</h1>
+          <p className="mt-4 text-white/85">Each paper keeps its own clock. The camera asks before it starts. A raised hand shows up here as an alert.</p>
         </div>
-        <p className="text-sm text-stone-500">Twenty minutes left is a warm warning. Five minutes left is heavy. At zero, an unsubmitted paper scores nothing.</p>
+        <p className="text-sm text-white/75">Twenty minutes left is a warm warning. Five minutes left is heavy. At zero, an unsubmitted paper scores nothing.</p>
       </section>
-      <section className="flex items-center justify-center px-6 py-12">
-        <form className="w-full max-w-md rounded-3xl bg-white p-6 shadow-xl shadow-stone-200" onSubmit={submit}>
-          <h2 className="font-serif text-3xl">Sign in</h2>
+      <section className="flex items-center justify-center bg-[#fbfbfb] px-6 py-12 md:min-h-screen">
+        <form className="w-full max-w-md rounded-lg bg-white p-6 shadow-[0_2px_15px_-3px_rgba(0,0,0,0.07),0_10px_20px_-2px_rgba(0,0,0,0.04)]" onSubmit={submit}>
+          <h2 className="text-xl font-medium text-[#332d2d]">Sign in</h2>
           <label className="mt-5 block text-sm">Email<input className={field} value={email} onChange={(event) => setEmail(event.target.value)} /></label>
           <label className="mt-4 block text-sm">Password<input className={field} type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
           {error && <p className="mt-3 text-sm text-red-700">{error}</p>}
           <button className={`${primary} mt-5 w-full`} type="submit">Sign in</button>
           <button className={`${ghost} mt-3 w-full`} type="button" onClick={onJoin}>I have an invitation</button>
+          <button className="mt-4 text-sm font-medium text-[#3b71ca] hover:underline" type="button" onClick={() => setHelp(true)}>Help</button>
           <div className="mt-5 space-y-1 text-xs text-stone-500">
             <div>Teacher: leila.nansubuga@rms.local / Harbor-Teach-19</div>
             <div>Student: jamal.ssebunya@rms.local / Harbor-Study-19</div>
@@ -232,11 +247,11 @@ function StaffAlerts({ desk, quiet }) {
 function useToasts() {
   const [toasts, setToasts] = useState([]);
   const push = (toast) => {
-    const id = crypto.randomUUID();
+    const id = `toast-${Date.now()}-${toasts.length}-${Math.random().toString(16).slice(2)}`;
     setToasts((current) => [...current, { id, ...toast }]);
     window.setTimeout(() => {
       setToasts((current) => current.filter((item) => item.id !== id));
-    }, 5600);
+    }, 12000);
   };
   const dismiss = (id) => setToasts((current) => current.filter((item) => item.id !== id));
   return { toasts, push, dismiss };
@@ -249,7 +264,7 @@ function Toaster({ toasts, onDismiss }) {
       {toasts.map((toast) => (
         <div
           key={toast.id}
-          className={`toast-in pointer-events-auto flex items-start gap-3 rounded-2xl px-4 py-3 text-white shadow-2xl ${toast.tone === "error" ? "bg-red-700" : "bg-stone-950"}`}
+          className={`toast-in pointer-events-auto flex items-start gap-3 rounded px-4 py-3 text-white shadow-[0_2px_15px_-3px_rgba(0,0,0,0.2)] ${toast.tone === "error" ? "bg-[#dc4c64]" : "bg-[#3b71ca]"}`}
           role={toast.tone === "error" ? "alert" : "status"}
         >
           <div className="min-w-0 flex-1">
@@ -263,7 +278,7 @@ function Toaster({ toasts, onDismiss }) {
   );
 }
 
-function ExamFileDrop({ file, onFile }) {
+function ExamFileDrop({ file, onFile, onMany, multiple = false, idleTitle = "Excel, Word, or CSV", idleLabel = "DROP THE PAPER", hint = "Drag the file here, or browse. The questions and answers are read from the file. Nothing is typed on this page." }) {
   const [over, setOver] = useState(false);
   const inputRef = useRef(null);
 
@@ -291,23 +306,28 @@ function ExamFileDrop({ file, onFile }) {
       onDrop={(event) => {
         event.preventDefault();
         setOver(false);
-        take(event.dataTransfer.files?.[0]);
+        const dropped = [...(event.dataTransfer.files || [])];
+        if (multiple && onMany && dropped.length > 1) onMany(dropped);
+        else take(dropped[0]);
       }}
     >
       <input
         ref={inputRef}
         className="sr-only"
         type="file"
+        multiple={multiple}
         accept=".xlsx,.docx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/csv"
         onChange={(event) => {
-          take(event.target.files?.[0]);
+          const chosen = [...(event.target.files || [])];
+          if (multiple && onMany && chosen.length > 1) onMany(chosen);
+          else take(chosen[0]);
           event.target.value = "";
         }}
       />
-      <p className="text-xs font-medium tracking-[0.16em] text-stone-500">{file ? "FILE READY" : "DROP THE PAPER"}</p>
-      <p className="mt-2 font-serif text-3xl">{file ? file.name : "Excel, Word, or CSV"}</p>
+      <p className="text-xs font-medium tracking-[0.16em] text-stone-500">{file ? "FILE READY" : idleLabel}</p>
+      <p className="mt-2 font-serif text-3xl">{file ? file.name : idleTitle}</p>
       <p className="mx-auto mt-2 max-w-md text-sm text-stone-500">
-        {file ? `${Math.max(1, Math.round(file.size / 1024))} KB ready to upload.` : "Drag the file here, or browse. The questions and answers are read from the file. Nothing is typed on this page."}
+        {file ? `${Math.max(1, Math.round(file.size / 1024))} KB ready to upload.` : hint}
       </p>
       <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
         <button className={primary} type="button" onClick={() => inputRef.current?.click()}>{file ? "Choose a different file" : "Browse files"}</button>
@@ -410,6 +430,8 @@ function UploadExam({ onSaved, onError }) {
   const [title, setTitle] = useState("");
   const [durationMinutes, setDurationMinutes] = useState("");
   const [file, setFile] = useState(null);
+  const [key, setKey] = useState(null);
+  const [problem, setProblem] = useState("");
   const [saving, setSaving] = useState(false);
 
   async function create(event) {
@@ -424,15 +446,20 @@ function UploadExam({ onSaved, onError }) {
       data.append("title", title);
       data.append("durationMinutes", String(durationMinutes));
       data.append("file", file);
+      if (key) data.append("key", key);
       const response = await fetch("/api/assessments/file", { method: "POST", credentials: "include", body: data });
       const uploaded = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(uploaded?.error || "The file could not be read.");
+      if (!response.ok) throw new Error(uploaded?.error || `The file could not be read (${response.status}).`);
       setTitle("");
       setDurationMinutes("");
       setFile(null);
+      setKey(null);
+      setProblem("");
       onSaved(title, uploaded?.questionCount);
     } catch (err) {
-      onError(err.message);
+      const message = err?.message || "The file could not be read.";
+      setProblem(message);
+      try { onError(message); } catch { /* The message stays on the form. */ }
     } finally {
       setSaving(false);
     }
@@ -450,7 +477,25 @@ function UploadExam({ onSaved, onError }) {
           <label className="text-sm font-medium">Paper title<input className={field} value={title} onChange={(event) => setTitle(event.target.value)} required /></label>
           <label className="text-sm font-medium">Minutes<input className={field} type="number" min="1" max="300" value={durationMinutes} onChange={(event) => setDurationMinutes(event.target.value)} required /></label>
         </div>
-        <ExamFileDrop file={file} onFile={(next, problem) => { setFile(next); if (problem) onError(problem); }} />
+        <ExamFileDrop
+          file={file}
+          multiple
+          onFile={(next, message) => { setFile(next); setProblem(message || ""); if (message) onError(message); }}
+          onMany={(files) => {
+            const answer = files.find((item) => /answer|key/i.test(item.name));
+            const paper = files.find((item) => item !== answer) || files[0];
+            setFile(paper);
+            if (answer) setKey(answer);
+            setProblem("");
+          }}
+        />
+        <ExamFileDrop
+          file={key}
+          idleLabel="ANSWER SHEET"
+          idleTitle="Optional Word file"
+          hint="Add this when the questions file has no answers. It is the sheet with the key."
+          onFile={(next, message) => { setKey(next); setProblem(message || ""); if (message) onError(message); }}
+        />
         <div className="grid gap-3 sm:grid-cols-2">
           <article className="rounded-3xl border border-stone-200 bg-white p-5">
             <h2 className="font-serif text-2xl">Excel or CSV</h2>
@@ -458,11 +503,133 @@ function UploadExam({ onSaved, onError }) {
           </article>
           <article className="rounded-3xl border border-stone-200 bg-white p-5">
             <h2 className="font-serif text-2xl">Word</h2>
-            <p className="mt-2 text-sm leading-6 text-stone-600">Use that same table, or a list: the question, then A. to D., then Answer: and Marks:. A short question is the prompt, then Answer: and Marks:.</p>
+            <p className="mt-2 text-sm leading-6 text-stone-600">A question table can keep A) to D) in one options cell. True or false lines, short questions, and scenarios are read too. If the answers live in a second Word file, add that answer sheet.</p>
           </article>
         </div>
+        {problem && <p className="rounded-2xl bg-red-50 px-4 py-3 text-sm font-medium text-red-800" role="alert">{problem}</p>}
         <button className={primary} type="submit" disabled={saving || !file}>{saving ? "Uploading…" : "Upload exam"}</button>
       </form>
+    </>
+  );
+}
+
+function MarkDesk({ onChanged }) {
+  const [rows, setRows] = useState(null);
+  const [script, setScript] = useState(null);
+  const [awards, setAwards] = useState({});
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function load() {
+    setRows(await api("/api/marking"));
+  }
+
+  useEffect(() => {
+    load().catch((err) => setError(err.message));
+  }, []);
+
+  async function open(id) {
+    setError("");
+    const body = await api(`/api/marking/${id}`);
+    const next = {};
+    for (const item of body.questions) next[item.id] = item.awarded ?? 0;
+    setAwards(next);
+    setScript(body);
+  }
+
+  async function save() {
+    setSaving(true);
+    setError("");
+    try {
+      const body = await api(`/api/marking/${script.id}`, {
+        method: "POST",
+        body: JSON.stringify({
+          awards: script.questions.map((question) => {
+            const marks = Number(awards[question.id]);
+            return { questionId: question.id, marks: Number.isFinite(marks) ? marks : 0 };
+          })
+        })
+      });
+      setScript(body);
+      await load();
+      onChanged();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (script) {
+    const locked = script.status === "marked";
+    return (
+      <>
+        <header className="mb-6 flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <p className="text-xs font-medium tracking-[0.16em] text-amber-800">SECTION B</p>
+            <h1 className="mt-1 font-serif text-4xl">{script.paper}</h1>
+            <p className="mt-1 text-stone-500">{script.studentName} · {script.email}</p>
+          </div>
+          <button className={ghost} type="button" onClick={() => setScript(null)}>Back to the list</button>
+        </header>
+        <p className="mb-4 text-sm text-stone-600">Section A {script.sectionAScore} of {script.sectionAMax} ({script.percent}%). Award the written answers below. The system does not mark them.</p>
+        {error && <p className="mb-4 rounded-2xl bg-red-50 px-4 py-3 text-sm font-medium text-red-800" role="alert">{error}</p>}
+        <div className="grid gap-4">
+          {script.questions.map((question, index) => (
+            <article className="rounded-3xl border border-stone-200 bg-white p-5" key={question.id}>
+              <p className="text-xs font-medium text-stone-500">Written {index + 1} · {question.marks} mark{question.marks === 1 ? "" : "s"}</p>
+              <h2 className="mt-2 font-serif text-2xl">{question.prompt}</h2>
+              <p className="mt-3 text-sm text-stone-500">Candidate answer</p>
+              <p className="mt-1 whitespace-pre-wrap rounded-2xl bg-stone-50 px-4 py-3 text-stone-800">{question.response || "No answer was saved."}</p>
+              <p className="mt-3 text-sm text-stone-500">Model answer</p>
+              <p className="mt-1 whitespace-pre-wrap text-sm text-stone-600">{question.model}</p>
+              <label className="mt-4 block text-sm font-medium">
+                Marks awarded
+                <input
+                  className={`${field} max-w-32`}
+                  type="number"
+                  min="0"
+                  max={question.marks}
+                  value={awards[question.id] ?? 0}
+                  disabled={locked}
+                  onChange={(event) => setAwards((current) => ({ ...current, [question.id]: event.target.value }))}
+                />
+              </label>
+            </article>
+          ))}
+        </div>
+        {locked ? (
+          <p className="mt-6 font-serif text-3xl">Total {script.score} / {script.maxScore}</p>
+        ) : (
+          <button className={`${primary} mt-6`} type="button" disabled={saving} onClick={save}>{saving ? "Saving…" : "Save marks and email the candidate"}</button>
+        )}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <header className="mb-6">
+        <h1 className="font-serif text-4xl">Mark written</h1>
+        <p className="mt-1 max-w-xl text-stone-500">These candidates scored at least 70% on Section A. Their written answers are saved here for you to award.</p>
+      </header>
+      {error && <p className="mb-4 text-sm text-red-700">{error}</p>}
+      {rows === null && <p>Loading…</p>}
+      <div className="grid gap-3">
+        {(rows || []).map((row) => (
+          <article className="flex flex-wrap items-center justify-between gap-3 rounded-3xl border border-stone-200 bg-white p-5" key={row.id}>
+            <div>
+              <p className="font-medium">{row.studentName}</p>
+              <p className="text-sm text-stone-500">{row.paper} · Section A {row.sectionAScore} / {row.sectionAMax}</p>
+            </div>
+            <div className="flex items-center gap-3">
+              <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${row.status === "awaiting" ? "bg-amber-100 text-amber-950" : "bg-emerald-100 text-emerald-900"}`}>{row.status === "awaiting" ? "Needs marks" : `Marked ${row.sectionBScore} / ${row.sectionBMax}`}</span>
+              <button className={primary} type="button" onClick={() => open(row.id).catch((err) => setError(err.message))}>{row.status === "awaiting" ? "Award marks" : "Review"}</button>
+            </div>
+          </article>
+        ))}
+      </div>
+      {rows && rows.length === 0 && <p>No written paper is waiting.</p>}
     </>
   );
 }
@@ -471,17 +638,20 @@ function Teacher({ me, onLogout }) {
   const [page, setPage] = useState("wall");
   const [papers, setPapers] = useState([]);
   const [counts, setCounts] = useState({ undertaking: 0, submitted: 0 });
+  const [markCount, setMarkCount] = useState(0);
   const toasts = useToasts();
   const desk = useStaffDesk();
   const examChecks = useExamChecks(desk);
 
   async function load() {
-    const [nextPapers, summary] = await Promise.all([
+    const [nextPapers, summary, queue] = await Promise.all([
       api("/api/assessments"),
-      api("/api/sittings?status=submitted&draw=1&start=0&length=1")
+      api("/api/sittings?status=submitted&draw=1&start=0&length=1"),
+      api("/api/marking")
     ]);
     setPapers(nextPapers);
     setCounts({ undertaking: summary.undertakingTotal, submitted: summary.submittedTotal });
+    setMarkCount(queue.filter((row) => row.status === "awaiting").length);
   }
 
   useEffect(() => {
@@ -500,20 +670,25 @@ function Teacher({ me, onLogout }) {
 
   const nav = (
     <>
-      <NavButton active={page === "wall"} onClick={() => setPage("wall")}>Streams</NavButton>
-      <NavButton active={page === "papers"} onClick={() => setPage("papers")}>Exams</NavButton>
-      <NavButton active={page === "undertaking"} onClick={() => setPage("undertaking")}>
+      <NavButton icon="streams" active={page === "wall"} onClick={() => setPage("wall")}>Streams</NavButton>
+      <NavButton icon="exams" active={page === "papers"} onClick={() => setPage("papers")}>Exams</NavButton>
+      <NavButton icon="clock" active={page === "undertaking"} onClick={() => setPage("undertaking")}>
         Undertaking <em className="rounded-full bg-amber-200 px-2 py-0.5 text-xs text-stone-950 not-italic">{counts.undertaking}</em>
       </NavButton>
-      <NavButton active={page === "submitted"} onClick={() => setPage("submitted")}>
+      <NavButton icon="check" active={page === "submitted"} onClick={() => setPage("submitted")}>
         Submitted <em className="rounded-full bg-emerald-200 px-2 py-0.5 text-xs text-stone-950 not-italic">{counts.submitted}</em>
       </NavButton>
-      <NavButton active={page === "write"} onClick={() => setPage("write")}>Write exam</NavButton>
-      <NavButton active={page === "upload"} onClick={() => setPage("upload")}>Upload exam</NavButton>
-      <NavButton active={page === "summary"} onClick={() => setPage("summary")}>
+      <NavButton icon="write" active={page === "write"} onClick={() => setPage("write")}>Write exam</NavButton>
+      <NavButton icon="upload" active={page === "upload"} onClick={() => setPage("upload")}>Upload exam</NavButton>
+      <NavButton icon="mark" active={page === "mark"} onClick={() => setPage("mark")}>
+        Mark written {markCount > 0 && <em className="rounded-full bg-amber-200 px-2 py-0.5 text-xs text-stone-950 not-italic">{markCount}</em>}
+      </NavButton>
+      <NavButton icon="summary" active={page === "summary"} onClick={() => setPage("summary")}>
         Summary {examChecks.checks.length > 0 && <em className="rounded-full bg-red-500 px-2 py-0.5 text-xs text-white not-italic">{examChecks.checks.length}</em>}
       </NavButton>
-      {me.role === "superadmin" && <NavButton active={page === "assign"} onClick={() => setPage("assign")}>Assign</NavButton>}
+      {me.role === "superadmin" && <NavButton icon="assign" active={page === "assign"} onClick={() => setPage("assign")}>Assign</NavButton>}
+      {me.role === "superadmin" && <NavButton icon="audit" active={page === "audit"} onClick={() => setPage("audit")}>Audit</NavButton>}
+      <NavButton icon="help" active={page === "help"} onClick={() => setPage("help")}>Help</NavButton>
     </>
   );
 
@@ -523,6 +698,10 @@ function Teacher({ me, onLogout }) {
     <SummaryDesk />
   ) : page === "assign" ? (
     <AssignDesk />
+  ) : page === "audit" ? (
+    <AuditPage />
+  ) : page === "help" ? (
+    <HelpGuide role={me.role} />
   ) : page === "wall" ? (
     <LiveWall desk={desk} empty="No candidate is in a paper right now." />
   ) : page === "papers" ? (
@@ -554,6 +733,8 @@ function Teacher({ me, onLogout }) {
         </div>
       )}
     </>
+  ) : page === "mark" ? (
+    <MarkDesk onChanged={() => load().catch(() => {})} />
   ) : page === "undertaking" || page === "submitted" ? (
     <SittingPage
       key={page}
@@ -622,6 +803,12 @@ function SittingPage({ status, title, onOpen, onCounts }) {
                 const label = `${formatRemaining(row.remainingSeconds)} left`;
                 return type === "display" ? pill(label, "amber") : row.remainingSeconds;
               }
+              if (row.status === "awaiting") return type === "display" ? pill("Written saved", "amber") : 0;
+              if (row.status === "failed") {
+                const label = `Fail ${row.score} / ${row.maxScore}`;
+                return type === "display" ? pill(label, "red") : row.score;
+              }
+              if (row.status === "expired") return type === "display" ? pill("Time up", "stone") : row.score;
               const label = `${row.score} / ${row.maxScore}`;
               return type === "display" ? pill(label, row.score > 0 ? "emerald" : "stone") : row.score;
             }
@@ -693,20 +880,21 @@ function Invigilator({ me, onLogout }) {
       alerts={<StaffAlerts desk={desk} quiet />}
       nav={
         <>
-          <NavButton active={page === "candidates"} onClick={() => setPage("candidates")}>
+          <NavButton icon="candidates" active={page === "candidates"} onClick={() => setPage("candidates")}>
             Candidates <em className="rounded-full bg-amber-200 px-2 py-0.5 text-xs text-stone-950 not-italic">{assigned}</em>
           </NavButton>
-          <NavButton active={page === "wall"} onClick={() => setPage("wall")}>
+          <NavButton icon="streams" active={page === "wall"} onClick={() => setPage("wall")}>
             Streams <em className="rounded-full bg-emerald-200 px-2 py-0.5 text-xs text-stone-950 not-italic">{count}</em>
           </NavButton>
-          <NavButton active={page === "summary"} onClick={() => setPage("summary")}>
+          <NavButton icon="summary" active={page === "summary"} onClick={() => setPage("summary")}>
             Summary {examChecks.checks.length > 0 && <em className="rounded-full bg-red-500 px-2 py-0.5 text-xs text-white not-italic">{examChecks.checks.length}</em>}
           </NavButton>
+          <NavButton icon="help" active={page === "help"} onClick={() => setPage("help")}>Help</NavButton>
         </>
       }
     >
       <CheckBanners checks={examChecks.checks} sound={desk.sound} onSound={desk.enableSound} onSeen={examChecks.seen} onOpen={() => setPage("summary")} />
-      {page === "summary" ? <SummaryDesk /> : page === "wall" ? <LiveWall desk={desk} empty="No assigned candidate is in a paper right now." onCount={setCount} /> : <WatchList onCount={setAssigned} />}
+      {page === "help" ? <HelpGuide role="invigilator" /> : page === "summary" ? <SummaryDesk /> : page === "wall" ? <LiveWall desk={desk} empty="No assigned candidate is in a paper right now." onCount={setCount} /> : <WatchList onCount={setAssigned} />}
     </Desk>
   );
 }
@@ -1096,6 +1284,7 @@ function LiveVideo({ stream, sittingId, large }) {
 
 function AssignDesk() {
   const [roster, setRoster] = useState(null);
+  const [tab, setTab] = useState("invigilator");
   const [examId, setExamId] = useState("");
   const [invigilatorId, setInvigilatorId] = useState("");
   const [picked, setPicked] = useState(0);
@@ -1111,9 +1300,9 @@ function AssignDesk() {
 
   useEffect(() => { load().catch((err) => setError(err.message)); }, []);
 
-  const candidates = roster && examId
-    ? roster.students.filter((student) => student.examIds.includes(Number(examId)))
-    : [];
+  const candidates = roster?.students ?? [];
+  const onExam = examId ? candidates.filter((student) => student.examIds.includes(Number(examId))) : [];
+  const exam = roster?.exams.find((item) => String(item.id) === String(examId));
   const invigilator = roster?.invigilators.find((item) => String(item.id) === String(invigilatorId));
 
   useEffect(() => {
@@ -1122,7 +1311,6 @@ function AssignDesk() {
     const host = hostRef.current;
     if (!host) return undefined;
     host.replaceChildren();
-    if (!examId) return undefined;
     const table = document.createElement("table");
     table.className = "display";
     table.style.width = "100%";
@@ -1136,15 +1324,16 @@ function AssignDesk() {
           orderable: false,
           searchable: false,
           width: "36px",
-          render: (id) => `<input type="checkbox" data-id="${id}" aria-label="Select candidate" ${selectedRef.current.has(id) ? "checked" : ""}>`
+          render: (id) => `<input type="checkbox" data-id="${id}" aria-label="Select candidate" ${selectedRef.current.has(Number(id)) ? "checked" : ""}>`
         },
         { data: "fullName", title: "Candidate" },
         { data: "email", title: "Email" },
+        { data: "exams", title: "Exam", render: (value, type) => type === "display" ? pill(value || "No exam", value ? "stone" : "amber") : (value || "") },
         { data: "invigilatorName", title: "Invigilator", render: (value, type) => type === "display" ? pill(value || "Unassigned", value ? "emerald" : "amber") : (value || "Unassigned") }
       ],
       pageLength: 8,
       order: [[1, "asc"]],
-      language: { emptyTable: "No candidate on this exam has joined yet.", zeroRecords: "No matches.", search: "Search:", lengthMenu: "Show _MENU_", info: "Showing _START_ to _END_ of _TOTAL_" }
+      language: { emptyTable: "No candidates yet.", zeroRecords: "No matches.", search: "Search:", lengthMenu: "Show _MENU_", info: "Showing _START_ to _END_ of _TOTAL_" }
     });
     tableRef.current = dt;
     function onChange(event) {
@@ -1152,7 +1341,7 @@ function AssignDesk() {
       if (!(input instanceof HTMLInputElement) || input.type !== "checkbox") return;
       const id = Number(input.dataset.id);
       if (!id) return;
-      const next = new Set(selectedRef.current);
+      const next = new Set([...selectedRef.current].map(Number));
       if (input.checked) next.add(id);
       else next.delete(id);
       selectedRef.current = next;
@@ -1165,13 +1354,13 @@ function AssignDesk() {
       try { dt.destroy(); } catch { /* The page already left. */ }
       host.replaceChildren();
     };
-  }, [examId, roster]);
+  }, [roster]);
 
   function tickSearch() {
     const dt = tableRef.current;
     if (!dt) return;
-    const visible = dt.rows({ search: "applied" }).data().toArray().map((row) => row.id);
-    const next = new Set(selectedRef.current);
+    const visible = dt.rows({ search: "applied" }).data().toArray().map((row) => Number(row.id));
+    const next = new Set([...selectedRef.current].map(Number));
     const allOn = visible.length > 0 && visible.every((id) => next.has(id));
     visible.forEach((id) => { if (allOn) next.delete(id); else next.add(id); });
     selectedRef.current = next;
@@ -1180,8 +1369,32 @@ function AssignDesk() {
   }
 
   function chosenIds(everyone) {
-    if (everyone) return candidates.map((student) => student.id);
-    return [...selectedRef.current].filter((id) => candidates.some((student) => student.id === id));
+    const pool = everyone ? onExam : candidates;
+    if (everyone) return pool.map((student) => student.id);
+    const host = hostRef.current;
+    const ticked = host
+      ? [...host.querySelectorAll("input[type=checkbox][data-id]:checked")].map((input) => Number(input.dataset.id))
+      : [];
+    const ids = new Set([...selectedRef.current].map(Number).concat(ticked));
+    return [...ids].filter((id) => pool.some((student) => student.id === id));
+  }
+
+  async function giveExam() {
+    const studentIds = chosenIds(false);
+    if (!examId || studentIds.length === 0) return;
+    setBusy(true);
+    setError("");
+    try {
+      const body = await api("/api/roster/exam", { method: "POST", body: JSON.stringify({ studentIds, assessmentId: Number(examId) }) });
+      selectedRef.current = new Set();
+      setPicked(0);
+      await load();
+      if (body.assigned === 0) setError("Those candidates already have that exam.");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function assign(everyone) {
@@ -1203,28 +1416,50 @@ function AssignDesk() {
 
   if (!roster) return <p className="text-stone-500">Loading assignments…</p>;
 
+  const tabClass = (name) => `border-b-2 px-4 py-2 text-sm font-medium ${tab === name ? "border-[#3b71ca] text-[#3b71ca]" : "border-transparent text-[#4f4f4f] hover:bg-black/[0.04]"}`;
+
   return (
     <>
-      <header className="mb-6">
-        <h1 className="font-serif text-4xl">Assign invigilators</h1>
-        <p className="mt-1 max-w-2xl text-stone-500">Pick the exam, then the invigilator. The table lists candidates already mapped to that exam. Search it, tick rows, and assign them together.</p>
+      <header className="mb-4">
+        <h1 className="font-serif text-4xl">Assign</h1>
+        <p className="mt-1 max-w-2xl text-stone-500">{tab === "invigilator" ? "Tick candidates, choose an invigilator, and put them with that person." : "Tick candidates, choose an exam, and put them on that paper."}</p>
       </header>
+      <div className="mb-6 flex gap-1 border-b border-black/10" role="tablist">
+        <button className={tabClass("invigilator")} type="button" role="tab" aria-selected={tab === "invigilator"} onClick={() => setTab("invigilator")}>Assign invigilator</button>
+        <button className={tabClass("candidate")} type="button" role="tab" aria-selected={tab === "candidate"} onClick={() => setTab("candidate")}>Assign candidate</button>
+      </div>
       {error && <p className="mb-4 text-sm text-red-700">{error}</p>}
-      <div className="mb-4 grid gap-4 sm:grid-cols-2">
-        <SearchSelect label="Exam" value={examId} options={roster.exams.map((exam) => ({ id: exam.id, name: exam.title }))} placeholder="Search exams" onChange={setExamId} />
-        <SearchSelect label="Invigilator" value={invigilatorId} options={roster.invigilators.map((item) => ({ id: item.id, name: item.fullName, detail: item.email }))} placeholder="Search invigilators" onChange={setInvigilatorId} />
-      </div>
-      <div className="mb-4 flex flex-wrap gap-2">
-        <button className={ghost} type="button" disabled={!examId || candidates.length === 0} onClick={tickSearch}>Tick this search</button>
-        <button className={primary} type="button" disabled={busy || !invigilator || picked === 0} onClick={() => assign(false)}>
-          {picked > 0 && invigilator ? `Assign ${picked} to ${invigilator.fullName}` : "Assign selected"}
-        </button>
-        <button className={ghost} type="button" disabled={busy || !invigilator || !examId || candidates.length === 0} onClick={() => assign(true)}>
-          {invigilator && examId ? `Assign everyone on this exam to ${invigilator.fullName}` : "Assign everyone on this exam"}
-        </button>
-      </div>
-      {!examId && <p className="rounded-3xl bg-white px-4 py-6 text-stone-500">Choose an exam to see its candidates.</p>}
-      <div ref={hostRef} className={examId ? "rounded-3xl bg-white p-4 shadow-sm" : "hidden"} />
+      {tab === "invigilator" ? (
+        <div className="mb-4 grid gap-4 sm:grid-cols-[1fr_auto] sm:items-end">
+          <label className="block text-sm">
+            Invigilator
+            <select className={field} value={invigilatorId} onChange={(event) => setInvigilatorId(event.target.value)}>
+              <option value="">Choose who will watch them</option>
+              {roster.invigilators.map((item) => (
+                <option key={item.id} value={item.id}>{item.fullName} · {roleLabel(item.role)}</option>
+              ))}
+            </select>
+            <span className="mt-1 block text-xs text-stone-500">Teachers, managers, and invigilators are listed. The system admin adds more invigilators under Create staff.</span>
+          </label>
+          <div className="flex flex-wrap gap-2">
+            <button className={ghost} type="button" disabled={candidates.length === 0} onClick={tickSearch}>Tick this search</button>
+            <button className={primary} type="button" disabled={busy || !invigilator || picked === 0} onClick={() => assign(false)}>
+              {picked > 0 && invigilator ? `Assign ${picked} to ${invigilator.fullName}` : picked > 0 ? "Choose an invigilator" : "Assign selected"}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="mb-4 grid gap-4 sm:grid-cols-[1fr_auto] sm:items-end">
+          <SearchSelect label="Exam" value={examId} options={roster.exams.map((item) => ({ id: item.id, name: item.title }))} placeholder="Search exams" onChange={setExamId} />
+          <div className="flex flex-wrap gap-2">
+            <button className={ghost} type="button" disabled={candidates.length === 0} onClick={tickSearch}>Tick this search</button>
+            <button className={primary} type="button" disabled={busy || !exam || picked === 0} onClick={giveExam}>
+              {picked > 0 && exam ? `Put ${picked} on ${exam.title}` : "Assign exam"}
+            </button>
+          </div>
+        </div>
+      )}
+      <div ref={hostRef} className="rounded-3xl bg-white p-4 shadow-sm" />
     </>
   );
 }
@@ -1233,6 +1468,7 @@ function Student({ me, onStart, onLogout }) {
   const [page, setPage] = useState("todo");
   const [papers, setPapers] = useState([]);
   const [error, setError] = useState("");
+  const [ready, setReady] = useState(null);
 
   useEffect(() => {
     api("/api/assessments").then(setPapers).catch((err) => setError(err.message));
@@ -1253,12 +1489,13 @@ function Student({ me, onStart, onLogout }) {
 
   const nav = (
     <>
-      <NavButton active={page === "todo"} onClick={() => setPage("todo")}>
+      <NavButton icon="take" active={page === "todo"} onClick={() => setPage("todo")}>
         To take <em className="rounded-full bg-amber-200 px-2 py-0.5 text-xs text-stone-950 not-italic">{open.length}</em>
       </NavButton>
-      <NavButton active={page === "done"} onClick={() => setPage("done")}>
+      <NavButton icon="done" active={page === "done"} onClick={() => setPage("done")}>
         Finished <em className="rounded-full bg-emerald-200 px-2 py-0.5 text-xs text-stone-950 not-italic">{done.length}</em>
       </NavButton>
+      <NavButton icon="help" active={page === "help"} onClick={() => setPage("help")}>Help</NavButton>
     </>
   );
 
@@ -1266,33 +1503,61 @@ function Student({ me, onStart, onLogout }) {
     <>
       <header className="mb-6">
         <h1 className="font-serif text-4xl">{page === "todo" ? "Exams to take" : "Finished exams"}</h1>
-        <p className="mt-1 max-w-xl text-stone-500">{page === "todo" ? "Open a card to start. The camera asks before the questions, and the clock is already running." : "Submitted papers keep their marks. A paper that ran out scores nothing."}</p>
+        <p className="mt-1 max-w-xl text-stone-500">{page === "todo" ? "Open a card to start. The camera asks before the questions, and the clock is already running." : "Section A needs 70% to open the written paper. A fail stays here. Written answers wait for an examiner."}</p>
       </header>
       {error && <p className="mb-4 text-sm text-red-700">{error}</p>}
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         {shown.map((paper) => (
-          <ExamCard key={paper.id} paper={paper} onOpen={() => start(paper.id)} />
+          <ExamCard key={paper.id} paper={paper} onOpen={() => (paper.sitting && paper.sitting.status !== "in_progress" ? start(paper.id) : setReady(paper))} />
         ))}
       </div>
       {shown.length === 0 && <p>{page === "todo" ? "No exam is assigned to you yet." : "No finished paper yet."}</p>}
     </>
   );
 
-  return <Desk me={me} onLogout={onLogout} nav={nav}>{body}</Desk>;
+  return (
+    <Desk me={me} onLogout={onLogout} nav={nav}>
+      {page === "help" ? <HelpGuide role="student" /> : body}
+      {ready && (
+        <div className="fixed inset-0 z-[80] grid place-items-center bg-black/50 px-6" role="alertdialog" aria-modal="true" aria-labelledby="prepare-title">
+          <div className="w-full max-w-lg rounded-lg bg-white p-8 shadow-[0_2px_15px_-3px_rgba(0,0,0,0.07),0_10px_20px_-2px_rgba(0,0,0,0.04)]">
+            <p className="text-xs font-medium tracking-[0.16em] text-[#e4a11b]">PREPARATION</p>
+            <h2 id="prepare-title" className="mt-2 text-3xl font-medium text-[#332d2d]">{ready.sitting?.status === "in_progress" ? "This paper is already running" : "You are about to start"}</h2>
+            <p className="mt-3 text-[#4f4f4f]">{ready.sitting?.status === "in_progress" ? `${ready.title} is already open. The clock does not reset.` : `${ready.title} is ${ready.durationMinutes} minutes. The clock starts when you continue, and it does not pause.`}</p>
+            <p className="mt-3 text-[#4f4f4f]">Section A is the objectives. You need 70% to open the written paper. Anything left blank scores 0. Below 70% the result is Fail and Section B stays closed.</p>
+            <p className="mt-3 text-[#4f4f4f]">Stay in this window. The camera asks before the questions.</p>
+            <div className="mt-6 flex flex-wrap gap-2">
+              <button className={primary} type="button" onClick={() => { const paper = ready; setReady(null); start(paper.id); }}>{ready.sitting?.status === "in_progress" ? "Continue" : "Start the exam"}</button>
+              <button className={ghost} type="button" onClick={() => setReady(null)}>Not yet</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </Desk>
+  );
 }
 
 function ExamCard({ paper, onOpen }) {
   const status = paper.sitting?.status;
-  const label = status === "in_progress" ? "In progress" : status === "submitted" ? "Submitted" : status === "expired" ? "No marks" : "To take";
+  const label = status === "in_progress"
+    ? (paper.sitting.stage === "B" ? "Section B" : "In progress")
+    : status === "submitted" ? "Passed"
+    : status === "expired" ? "Time up"
+    : status === "failed" ? "Failed"
+    : status === "awaiting" ? "Waiting for marks"
+    : status === "marked" ? "Marked"
+    : "To take";
   const action = status === "in_progress" ? "Resume" : status ? "Open result" : "Start";
-  const pill = status === "expired" ? "bg-red-100 text-red-900" : status === "submitted" ? "bg-emerald-100 text-emerald-900" : status === "in_progress" ? "bg-amber-100 text-amber-950" : "bg-stone-200 text-stone-800";
+  const tone = status === "expired" || status === "failed" ? "bg-red-100 text-red-900" : status === "submitted" || status === "marked" ? "bg-emerald-100 text-emerald-900" : status === "in_progress" || status === "awaiting" ? "bg-amber-100 text-amber-950" : "bg-stone-200 text-stone-800";
+  const showScore = status === "submitted" || status === "expired" || status === "failed" || status === "marked";
   return (
     <article className="flex flex-col justify-between rounded-3xl border border-stone-200 bg-white p-5 shadow-sm">
       <div>
-        <span className={`rounded-full px-2 py-1 text-xs font-medium ${pill}`}>{label}</span>
+        <span className={`rounded-full px-2 py-1 text-xs font-medium ${tone}`}>{label}</span>
         <h2 className="mt-3 font-serif text-2xl">{paper.title}</h2>
         <p className="mt-1 text-sm text-stone-500">{paper.questionCount} question{paper.questionCount === 1 ? "" : "s"} · {paper.maxScore} mark{paper.maxScore === 1 ? "" : "s"}</p>
-        {(status === "submitted" || status === "expired") && <p className="mt-3 font-serif text-3xl">{paper.sitting.score} / {paper.sitting.maxScore}</p>}
+        {showScore && <p className="mt-3 font-serif text-3xl">{paper.sitting.score} / {paper.sitting.maxScore}</p>}
+        {status === "awaiting" && <p className="mt-3 text-sm text-stone-600">Section A {paper.sitting.sectionAScore} / {paper.sitting.sectionAMax}. Written answers are saved.</p>}
       </div>
       <div className="mt-6 flex items-center justify-between">
         <strong>{paper.durationMinutes} min</strong>
